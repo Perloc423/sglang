@@ -348,6 +348,11 @@ class ServerArgs:
     abort_on_priority_when_disabled: bool = False
     schedule_low_priority_values_first: bool = False
     priority_scheduling_preemption_threshold: int = 10
+    enable_flowprefill: bool = False
+    flowprefill_granularity: str = "layer"
+    flowprefill_split_layers: int = 1
+    flowprefill_max_preemptions: int = 0
+    flowprefill_priority_policy: str = "priority_fcfs"
     schedule_conservativeness: float = 1.0
     page_size: Optional[int] = None
     swa_full_tokens_ratio: float = 0.8
@@ -3716,6 +3721,38 @@ class ServerArgs:
             help="Minimum difference in priorities for an incoming request to have to preempt running request(s).",
         )
         parser.add_argument(
+            "--enable-flowprefill",
+            action="store_true",
+            default=ServerArgs.enable_flowprefill,
+            help="Enable layer-level cooperative preemption for prefill using split-prefill execution.",
+        )
+        parser.add_argument(
+            "--flowprefill-granularity",
+            type=str,
+            default=ServerArgs.flowprefill_granularity,
+            choices=["layer"],
+            help="Granularity for FlowPrefill preemption checkpoints.",
+        )
+        parser.add_argument(
+            "--flowprefill-split-layers",
+            type=int,
+            default=ServerArgs.flowprefill_split_layers,
+            help="Number of layers to advance per split-prefill step when FlowPrefill is enabled.",
+        )
+        parser.add_argument(
+            "--flowprefill-max-preemptions",
+            type=int,
+            default=ServerArgs.flowprefill_max_preemptions,
+            help="Maximum number of cooperative preemptions allowed per request when FlowPrefill is enabled. 0 means unlimited.",
+        )
+        parser.add_argument(
+            "--flowprefill-priority-policy",
+            type=str,
+            default=ServerArgs.flowprefill_priority_policy,
+            choices=["priority_fcfs"],
+            help="Priority policy used to pick the next FlowPrefill batch.",
+        )
+        parser.add_argument(
             "--schedule-conservativeness",
             type=float,
             default=ServerArgs.schedule_conservativeness,
@@ -5830,6 +5867,20 @@ class ServerArgs:
                 logger.warning(
                     "--default-priority-value has no effect without --enable-priority-scheduling"
                 )
+
+        if self.enable_flowprefill:
+            assert self.flowprefill_granularity == "layer", (
+                "Only layer-level FlowPrefill is supported right now."
+            )
+            assert self.flowprefill_split_layers > 0, (
+                "--flowprefill-split-layers must be positive."
+            )
+            assert self.flowprefill_max_preemptions >= 0, (
+                "--flowprefill-max-preemptions must be non-negative."
+            )
+            assert self.flowprefill_priority_policy == "priority_fcfs", (
+                "Only priority_fcfs FlowPrefill scheduling is supported right now."
+            )
 
         # Check multi-item scoring
         if self.multi_item_scoring_delimiter is not None:

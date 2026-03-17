@@ -215,6 +215,15 @@ class Modality(Enum):
         return [Modality.IMAGE, Modality.VIDEO, Modality.AUDIO]
 
 
+class PrefillState(Enum):
+    WAITING = auto()
+    RUNNING = auto()
+    PREEMPT_PENDING = auto()
+    PREEMPTED = auto()
+    FINISHED = auto()
+    ABORTED = auto()
+
+
 class MultimodalInputFormat(Enum):
     NORMAL = auto()
     PROCESSOR_OUTPUT = auto()
@@ -770,6 +779,7 @@ class Req(ReqDllmMixin):
         self.time_stats.set_metrics_collector(metrics_collector)
         self.time_stats.set_scheduler_recv_time()
         self.has_log_time_stats: bool = False
+        self.arrival_time = self.time_stats.scheduler_recv_time
 
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
@@ -795,6 +805,13 @@ class Req(ReqDllmMixin):
 
         # For Matryoshka embeddings
         self.dimensions = dimensions
+
+        # For FlowPrefill
+        self.prefill_state: PrefillState = PrefillState.WAITING
+        self.prefill_deadline_ts: Optional[float] = None
+        self.prefill_preempt_pending: bool = False
+        self.prefill_num_preemptions: int = 0
+        self.prefill_resume_split_index: int = 0
 
         # For diffusion LLM
         self.init_diffusion_llm(dllm_config)
@@ -1131,6 +1148,10 @@ class Req(ReqDllmMixin):
         # to ensure shape consistency in KV cache.
         if self.input_embeds is not None:
             self.output_ids = []
+
+        self.prefill_state = PrefillState.WAITING
+        self.prefill_preempt_pending = False
+        self.prefill_resume_split_index = 0
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -1783,6 +1804,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.prepare_for_extend()
         # For split prefill, we need to set the forward mode to SPLIT_PREFILL
         self.forward_mode = ForwardMode.SPLIT_PREFILL
+        for req in self.reqs:
+            req.prefill_state = PrefillState.RUNNING
+            req.prefill_resume_split_index = self.split_index
+
+    def mark_flowprefill_preempt_pending(self):
+        for req in self.reqs:
+            req.prefill_preempt_pending = True
+            req.prefill_state = PrefillState.PREEMPT_PENDING
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED
