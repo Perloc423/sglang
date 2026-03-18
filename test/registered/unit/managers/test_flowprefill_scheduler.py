@@ -162,6 +162,41 @@ class TestFlowPrefillScheduler(CustomTestCase):
         self.assertEqual(req.prefill_state, PrefillState.PREEMPTED)
         self.assertEqual(req.prefill_resume_split_index, 2)
 
+    def test_preempted_queue_stores_requests_not_batches(self):
+        req0 = make_req("r0", priority=5, wait_time=1.0, split_index=1)
+        req1 = make_req("r1", priority=5, wait_time=1.5, split_index=1)
+        req0.prefill_preempt_pending = True
+        req1.prefill_preempt_pending = True
+        batch = make_batch([req0, req1], split_index=2)
+        self.scheduler.running_split_prefill_batch = batch
+
+        self.scheduler.process_batch_result_split_prefill(batch, MagicMock())
+
+        self.assertEqual(len(self.scheduler.preempted_prefill_queue), 2)
+        self.assertIs(self.scheduler.preempted_prefill_queue[0], req0)
+        self.assertIs(self.scheduler.preempted_prefill_queue[1], req1)
+        self.assertIs(req0.flowprefill_ctx.resume_batch, batch)
+        self.assertIs(req1.flowprefill_ctx.resume_batch, batch)
+
+    def test_sibling_preempted_requests_resume_together(self):
+        req0 = make_req("r0", priority=5, wait_time=1.0, split_index=2)
+        req1 = make_req("r1", priority=4, wait_time=2.0, split_index=2)
+        batch = make_batch([req0, req1], split_index=2)
+        req0.prefill_state = PrefillState.PREEMPTED
+        req1.prefill_state = PrefillState.PREEMPTED
+        req0.sync_flowprefill_ctx_from_batch(batch)
+        req1.sync_flowprefill_ctx_from_batch(batch)
+
+        self.scheduler.preempted_prefill_queue.append(req0)
+        self.scheduler.preempted_prefill_queue.append(req1)
+
+        selected = self.scheduler._get_next_flowprefill_candidate()
+
+        self.assertIs(selected, batch)
+        self.assertEqual(len(self.scheduler.preempted_prefill_queue), 0)
+        self.assertEqual(req0.prefill_state, PrefillState.RUNNING)
+        self.assertEqual(req1.prefill_state, PrefillState.RUNNING)
+
     def test_split_prefill_uses_forward_progress_for_completion(self):
         req = make_req("r0", priority=5, wait_time=1.0, split_index=2)
         batch = make_batch([req], split_index=2)

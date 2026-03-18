@@ -1959,6 +1959,20 @@ class Scheduler(
         batch.split_prefill_finished = False
         batch.split_forward_count = self.server_args.flowprefill_split_layers
 
+    def _get_flowprefill_resume_batch_for_req(
+        self, req: Req
+    ) -> Optional[ScheduleBatch]:
+        """Resolve the resumed batch for a parked FlowPrefill request.
+
+        Current behavior is still an intermediate request-owned design:
+        the queue stores requests, but multi-request resumes fall back to the
+        parked batch snapshot referenced from each request's FlowPrefill ctx.
+        This helper isolates that compatibility layer so we can later replace it
+        with true request-level regrouping.
+        """
+
+        return req.flowprefill_ctx.resume_batch
+
     def _pop_next_flowprefill_batch(self) -> Optional[ScheduleBatch]:
         if not self.preempted_prefill_queue:
             return None
@@ -1966,7 +1980,7 @@ class Scheduler(
         best_req = min(
             self.preempted_prefill_queue, key=self._flowprefill_preempted_req_priority_key
         )
-        best_batch = best_req.flowprefill_ctx.resume_batch
+        best_batch = self._get_flowprefill_resume_batch_for_req(best_req)
         if best_batch is None:
             self.preempted_prefill_queue.remove(best_req)
             return None
