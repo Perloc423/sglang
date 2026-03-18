@@ -838,9 +838,9 @@ class Req(ReqDllmMixin):
 
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""
-        assert (
-            not self.kv_committed_freed
-        ), f"Committed KV cache already freed ({self.kv_committed_len=})"
+        assert not self.kv_committed_freed, (
+            f"Committed KV cache already freed ({self.kv_committed_len=})"
+        )
         self.kv_committed_freed = True
         return self.kv_committed_len
 
@@ -850,9 +850,9 @@ class Req(ReqDllmMixin):
         # NOTE: This function is called when there is over-allocation of KV cache.
         # Over-allocation: we allocate more KV cache than the committed length.
         # e.g., speculative decoding may allocate more KV cache than actually used.
-        assert (
-            not self.kv_overallocated_freed
-        ), f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
+        assert not self.kv_overallocated_freed, (
+            f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
+        )
         self.kv_overallocated_freed = True
         return self.kv_committed_len, self.kv_allocated_len
 
@@ -1312,6 +1312,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     split_prefill_finished: bool = False
     split_forward_count: int = 1
     split_forward_batch: ForwardBatch = None
+    split_attn_backend_needs_reinit: bool = False
     seq_lens_cpu_cache: torch.Tensor = None
 
     # Stream
@@ -1466,9 +1467,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
 
-        assert (
-            len(self.out_cache_loc) == self.extend_num_tokens
-        ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
+        assert len(self.out_cache_loc) == self.extend_num_tokens, (
+            f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
+        )
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
@@ -1801,7 +1802,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_seqlens_cpu.append(mamba_track_seqlen)
 
     def prepare_for_split_prefill(self):
-        self.prepare_for_extend()
         # For split prefill, we need to set the forward mode to SPLIT_PREFILL
         self.forward_mode = ForwardMode.SPLIT_PREFILL
         for req in self.reqs:
@@ -1954,9 +1954,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         new_estimate_ratio = (
             total_decoded_tokens
             + envs.SGLANG_RETRACT_DECODE_STEPS.get() * len(self.reqs)
-        ) / (
-            total_max_new_tokens + 1
-        )  # avoid zero division
+        ) / (total_max_new_tokens + 1)  # avoid zero division
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
@@ -2318,6 +2316,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            split_forward_batch=self.split_forward_batch,
         )
 
     def copy(self):
@@ -2389,9 +2388,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         sliding_window_size = self.tree_cache.sliding_window_size
 
         # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
-        assert (
-            req.cache_protected_len % self.tree_cache.page_size == 0
-        ), "cache_protected_len must be page aligned"
+        assert req.cache_protected_len % self.tree_cache.page_size == 0, (
+            "cache_protected_len must be page aligned"
+        )
         req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
 
         new_swa_evicted_seqlen = max(
@@ -2512,3 +2511,6 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+
+    # For split prefill (FlowPrefill)
+    split_forward_batch: Optional[ForwardBatch] = None

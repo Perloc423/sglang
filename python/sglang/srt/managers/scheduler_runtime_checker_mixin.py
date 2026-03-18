@@ -188,6 +188,31 @@ class SchedulerRuntimeCheckerMixin:
             self.max_total_num_tokens - protected_size - session_held
         )
         token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}, {session_held=}\n"
+        if memory_leak and (
+            hasattr(self.token_to_kv_pool_allocator, "free_slots")
+            or hasattr(self.token_to_kv_pool_allocator, "free_pages")
+        ):
+            if hasattr(self.token_to_kv_pool_allocator, "free_slots"):
+                free_slots = set(self.token_to_kv_pool_allocator.free_slots.tolist())
+            else:
+                free_slots = set(self.token_to_kv_pool_allocator.free_pages.tolist())
+                if hasattr(self.token_to_kv_pool_allocator, "release_pages"):
+                    free_slots |= set(
+                        self.token_to_kv_pool_allocator.release_pages.tolist()
+                    )
+            cached_slots = set()
+            if self.tree_cache.is_tree_cache() and evictable_size + protected_size > 0:
+                try:
+                    cached_slots = set(self.tree_cache.all_values_flatten().tolist())
+                except RuntimeError:
+                    cached_slots = set()
+            expected_slots = set(range(1, self.max_total_num_tokens + 1))
+            leaked_slots = expected_slots - free_slots - cached_slots
+            sample_leaked_slots = sorted(leaked_slots)[:32]
+            token_msg += (
+                f"free_slot_count={len(free_slots)}, cached_slot_count={len(cached_slots)}, "
+                f"leaked_slot_count={len(leaked_slots)}, leaked_slot_sample={sample_leaked_slots if sample_leaked_slots else None}\n"
+            )
         return memory_leak, token_msg
 
     def _get_batch_uncached_size(self: Scheduler, batch: ScheduleBatch) -> int:
