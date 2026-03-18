@@ -1939,6 +1939,8 @@ class Scheduler(
     def _enqueue_preempted_flowprefill_batch(self, batch: ScheduleBatch) -> None:
         for req in batch.reqs:
             req.sync_flowprefill_ctx_from_batch(batch)
+            if len(batch.reqs) == 1:
+                req.flowprefill_ctx.resume_batch = None
         self._clear_flowprefill_batch_runtime_state(batch)
         batch.batch_is_full = False
         for req in batch.reqs:
@@ -1973,6 +1975,29 @@ class Scheduler(
 
         return req.flowprefill_ctx.resume_batch
 
+    def _get_flowprefill_single_req_resume_guard_failure(
+        self, req: Req
+    ) -> Optional[str]:
+        resume_batch = req.flowprefill_ctx.resume_batch
+        if req.flowprefill_ctx.split_forward_batch is None:
+            return "missing split_forward_batch"
+        if resume_batch is not None and len(resume_batch.reqs) != 1:
+            return "resume batch has multiple requests"
+        if req.return_logprob:
+            return "return_logprob is enabled"
+        if req.grammar is not None:
+            return "grammar-constrained request"
+        if req.input_embeds is not None:
+            return "input_embeds request"
+        if req.multimodal_inputs is not None:
+            return "multimodal request"
+        if self.model_config.is_encoder_decoder:
+            return "encoder-decoder model"
+        return None
+
+    def _can_resume_flowprefill_req_as_single_batch(self, req: Req) -> bool:
+        return self._get_flowprefill_single_req_resume_guard_failure(req) is None
+
     def _pop_next_flowprefill_batch(self) -> Optional[ScheduleBatch]:
         if not self.preempted_prefill_queue:
             return None
@@ -1980,9 +2005,47 @@ class Scheduler(
         best_req = min(
             self.preempted_prefill_queue, key=self._flowprefill_preempted_req_priority_key
         )
+        single_req_resume_failure = (
+            self._get_flowprefill_single_req_resume_guard_failure(best_req)
+        )
+        if single_req_resume_failure is None:
+            self.preempted_prefill_queue.remove(best_req)
+            best_req.prefill_state = PrefillState.RUNNING
+            best_req.prefill_resume_split_index = best_req.flowprefill_ctx.split_index
+            best_batch = ScheduleBatch.init_single_req_from_flowprefill_ctx(
+                best_req,
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator,
+                self.tree_cache,
+                self.model_config,
+                self.enable_overlap,
+                self.spec_algorithm,
+            )
+            logger.info(
+                "FlowPrefill: resuming single parked request "
+                "(rid=%s, split_index=%d, queue_remaining=%d)",
+                best_req.rid,
+                best_batch.split_index,
+                len(self.preempted_prefill_queue),
+            )
+            return best_batch
+        logger.debug(
+            "FlowPrefill: falling back to parked batch resume for req %s "
+            "(reason=%s, split_index=%d)",
+            best_req.rid,
+            single_req_resume_failure,
+            best_req.flowprefill_ctx.split_index,
+        )
+
         best_batch = self._get_flowprefill_resume_batch_for_req(best_req)
         if best_batch is None:
             self.preempted_prefill_queue.remove(best_req)
+            logger.warning(
+                "FlowPrefill: dropping parked request without resumable state "
+                "(rid=%s, split_index=%d)",
+                best_req.rid,
+                best_req.flowprefill_ctx.split_index,
+            )
             return None
 
         sibling_reqs = [

@@ -1427,6 +1427,93 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_config=dllm_config,
         )
 
+    @classmethod
+    def init_single_req_from_flowprefill_ctx(
+        cls,
+        req: Req,
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        tree_cache: BasePrefixCache,
+        model_config: ModelConfig,
+        enable_overlap: bool,
+        spec_algorithm: SpeculativeAlgorithm,
+        dllm_config: Optional[DllmConfig] = None,
+    ) -> "ScheduleBatch":
+        """Build a resumed split-prefill batch from request-owned FlowPrefill state.
+
+        This path intentionally avoids `prepare_for_extend()` so it can reuse the
+        existing split-prefill execution state without reallocating KV.
+        """
+
+        assert req.flowprefill_ctx.split_forward_batch is not None
+        forward_batch = req.flowprefill_ctx.split_forward_batch
+        seq_lens_cpu_cache = req.flowprefill_ctx.seq_lens_cpu_cache
+        if seq_lens_cpu_cache is None:
+            seq_lens_cpu_cache = forward_batch.seq_lens_cpu
+
+        is_hybrid_swa = isinstance(
+            token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+        )
+        batch = cls(
+            reqs=[req],
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            tree_cache=tree_cache,
+            is_hybrid_swa=is_hybrid_swa,
+            model_config=model_config,
+            enable_overlap=enable_overlap,
+            return_logprob=req.return_logprob,
+            has_stream=req.stream,
+            has_grammar=req.grammar is not None,
+            device=req_to_token_pool.device,
+            spec_algorithm=spec_algorithm,
+            return_hidden_states=req.return_hidden_states,
+            return_routed_experts=req.return_routed_experts,
+            is_prefill_only=req.is_prefill_only,
+            dllm_config=dllm_config,
+            forward_mode=ForwardMode.SPLIT_PREFILL,
+            split_index=req.flowprefill_ctx.split_index,
+            split_forward_count=1,
+            split_forward_batch=forward_batch,
+            split_attn_backend_needs_reinit=(
+                req.flowprefill_ctx.split_attn_backend_needs_reinit
+            ),
+            seq_lens_cpu_cache=seq_lens_cpu_cache,
+            input_ids=forward_batch.input_ids,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            seq_lens_cpu=forward_batch.seq_lens_cpu,
+            orig_seq_lens=forward_batch.orig_seq_lens,
+            out_cache_loc=forward_batch.out_cache_loc,
+            seq_lens_sum=forward_batch.seq_lens_sum,
+            prefix_lens=[len(req.prefix_indices)],
+            extend_lens=[req.extend_input_len],
+            extend_logprob_start_lens=[req.extend_logprob_start_len],
+            extend_num_tokens=req.extend_input_len,
+            multimodal_inputs=[req.multimodal_inputs],
+            encoder_cached=None,
+            encoder_lens=None,
+            encoder_lens_cpu=None,
+            encoder_out_cache_loc=forward_batch.encoder_out_cache_loc,
+            input_embeds=forward_batch.input_embeds,
+            token_type_ids=forward_batch.token_type_ids,
+            dimensions=[req.dimensions] if req.dimensions is not None else None,
+            mamba_track_indices=forward_batch.mamba_track_indices,
+            mamba_track_mask=forward_batch.mamba_track_mask,
+            mamba_track_seqlens=forward_batch.mamba_track_seqlens,
+        )
+        batch.top_logprobs_nums = [req.top_logprobs_num] if req.return_logprob else None
+        batch.token_ids_logprobs = (
+            [req.token_ids_logprob] if req.return_logprob else None
+        )
+        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            batch,
+            model_config.vocab_size,
+        )
+        batch.prepare_for_split_prefill()
+        req.sync_flowprefill_ctx_from_batch(batch)
+        return batch
+
     def batch_size(self):
         return len(self.reqs)
 

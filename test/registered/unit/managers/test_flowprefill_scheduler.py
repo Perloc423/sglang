@@ -1,8 +1,8 @@
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
-from sglang.srt.managers.schedule_batch import PrefillState
+from sglang.srt.managers.schedule_batch import PrefillState, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase
@@ -25,6 +25,20 @@ def make_req(rid: str, priority: int, wait_time: float, split_index: int = 0):
     req.prefill_resume_split_index = split_index
     req.prefill_state = PrefillState.WAITING
     req.to_finish = None
+    req.return_logprob = False
+    req.grammar = None
+    req.input_embeds = None
+    req.multimodal_inputs = None
+    req.stream = False
+    req.return_hidden_states = False
+    req.return_routed_experts = False
+    req.top_logprobs_num = 0
+    req.token_ids_logprob = None
+    req.extend_input_len = 1
+    req.extend_logprob_start_len = 0
+    req.prefix_indices = []
+    req.is_prefill_only = False
+    req.dimensions = None
     req.finished = lambda: False
     req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
     req.flowprefill_ctx = flowprefill_ctx
@@ -105,7 +119,9 @@ class TestFlowPrefillScheduler(CustomTestCase):
         self.scheduler.preempted_prefill_queue = deque()
         self.scheduler.running_split_prefill_batch = None
         self.scheduler.tree_cache = MagicMock()
-        self.scheduler.model_config = SimpleNamespace(num_hidden_layers=4)
+        self.scheduler.model_config = SimpleNamespace(
+            num_hidden_layers=4, is_encoder_decoder=False, vocab_size=32000
+        )
         self.scheduler.process_batch_result_prefill = MagicMock()
 
     def test_arrival_marks_running_batch_preempt_pending(self):
@@ -196,6 +212,48 @@ class TestFlowPrefillScheduler(CustomTestCase):
         self.assertEqual(len(self.scheduler.preempted_prefill_queue), 0)
         self.assertEqual(req0.prefill_state, PrefillState.RUNNING)
         self.assertEqual(req1.prefill_state, PrefillState.RUNNING)
+
+    def test_single_preempted_request_uses_request_owned_resume_path(self):
+        req = make_req("r0", priority=5, wait_time=1.0, split_index=2)
+        parked_batch = make_batch([req], split_index=2)
+        req.prefill_state = PrefillState.PREEMPTED
+        req.flowprefill_ctx.split_forward_batch = SimpleNamespace()
+        req.sync_flowprefill_ctx_from_batch(parked_batch)
+        req.flowprefill_ctx.resume_batch = None
+        resumed_batch = make_batch([req], split_index=2)
+
+        self.scheduler.preempted_prefill_queue.append(req)
+
+        with patch.object(
+            ScheduleBatch,
+            "init_single_req_from_flowprefill_ctx",
+            return_value=resumed_batch,
+        ) as init_resume:
+            selected = self.scheduler._get_next_flowprefill_candidate()
+
+        self.assertIs(selected, resumed_batch)
+        self.assertEqual(len(self.scheduler.preempted_prefill_queue), 0)
+        init_resume.assert_called_once()
+        self.assertEqual(req.prefill_state, PrefillState.RUNNING)
+
+    def test_single_req_resume_guard_rejects_multi_req_parked_batch(self):
+        req0 = make_req("r0", priority=5, wait_time=1.0, split_index=2)
+        req1 = make_req("r1", priority=4, wait_time=2.0, split_index=2)
+        batch = make_batch([req0, req1], split_index=2)
+        req0.flowprefill_ctx.split_forward_batch = SimpleNamespace()
+        req0.sync_flowprefill_ctx_from_batch(batch)
+
+        reason = self.scheduler._get_flowprefill_single_req_resume_guard_failure(req0)
+
+        self.assertEqual(reason, "resume batch has multiple requests")
+
+    def test_single_req_resume_guard_rejects_missing_forward_state(self):
+        req = make_req("r0", priority=5, wait_time=1.0, split_index=2)
+        req.flowprefill_ctx.resume_batch = None
+
+        reason = self.scheduler._get_flowprefill_single_req_resume_guard_failure(req)
+
+        self.assertEqual(reason, "missing split_forward_batch")
 
     def test_split_prefill_uses_forward_progress_for_completion(self):
         req = make_req("r0", priority=5, wait_time=1.0, split_index=2)

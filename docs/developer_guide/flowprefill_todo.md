@@ -14,6 +14,65 @@ layer-level MVP 与论文
 - 还未实现 SLO-aware batching、长短 prefill 分流、operator-level
   preemption 和 TP-safe coordinated preemption。
 
+## 当前实现进展
+
+截至本轮开发，FlowPrefill 已经从“纯 batch-level parked queue”推进到
+“request-owned state + req-level parked queue 的过渡形态”：
+
+- `Req` 已持有 `flowprefill_ctx`，用于保存 request-owned 的长期恢复态。
+- `preempted_prefill_queue` 已从 `ScheduleBatch` 级切到 `Req` 级。
+- 单请求 parked req 已支持一条真实的 request-owned resume 路径：
+  在满足安全 guard 时，不再依赖 `resume_batch`，而是直接从
+  `Req.flowprefill_ctx` 重建单请求 `ScheduleBatch`。
+- 多请求 parked batch 目前仍通过 `resume_batch` 兼容恢复；
+  这是一层显式过渡，不是最终设计。
+- 单请求 request-owned resume 的 guard 和 fallback reason 已显式化，
+  便于后续逐步放宽支持范围。
+
+当前还没有做到的关键点：
+
+- 多请求 preempted req 的真正 regroup 仍未实现。
+- 单请求 request-owned resume 仍只对安全子集开放：
+  非 logprob、非 grammar、非 multimodal、非 input_embeds、非
+  encoder-decoder 等。
+- 还没有接入 slack-aware scheduling，也没有引入 remaining-time predictor。
+
+## 下一步具体任务
+
+建议下一轮严格按下面顺序推进，不要并行扩散：
+
+### P0：把单请求 request-owned resume 跑实
+
+- 增加一个更贴近真实实现的测试，验证单请求恢复路径不会回到
+  `prepare_for_extend()`，也不会重新分配 KV。
+- 对 Llama / Qwen 的 split-prefill 路径做至少一轮手工或集成验证，
+  确认单请求恢复后的 forward 能真正从 `split_index > 0` 继续。
+- 补充单请求恢复时的日志和指标：
+  记录是否走 request-owned resume、是否 fallback、fallback reason。
+
+### P1：清理单请求恢复的 guard 边界
+
+- 审计当前 guard 的每个限制项是否真的是硬限制，优先判断：
+  `return_logprob`、grammar、`input_embeds`、multimodal、encoder-decoder。
+- 对能安全放开的项逐步移除 guard，并补对应测试。
+- 如果某个限制短期内不准备支持，要在用户文档和日志里写清楚。
+
+### P2：开始做真正的多请求 request-level resume
+
+- 去掉“多请求 parked batch 依赖 `resume_batch` 恢复”的兼容层。
+- 先支持最保守版本：
+  只允许相同 `split_index` 的 preempted req 单独恢复，不做 regroup。
+- 然后再做下一步：
+  支持相同 `split_index` 的多个 req regroup，继续禁止不同 `split_index`
+  混批。
+
+### P3：为后续 slack-aware scheduling 预留接口
+
+- 在 `Req` 上补齐 arrival/deadline/slack/remaining-time 需要的字段。
+- 把 `_flowprefill_priority_key()` 重构成 policy dispatcher，
+  为 `deadline_fcfs` 和 `slack_edf` 做接口预留。
+- 先加测试桩，不急着实现完整策略。
+
 论文与设计笔记中最值得保留的原则：
 
 - 解耦“抢占粒度”和“调度频率”。
@@ -77,6 +136,8 @@ predicted remaining prefill time 做调度。
 
 ### 1. 正确性
 
+- 明确当前实现已经进入“request-owned state + req-level parked queue”的
+  过渡阶段，并避免再把新的恢复逻辑继续绑定回 `ScheduleBatch`。
 - 重新审视当前 batch-level resume 设计，判断是否需要对同一
   `split_index` 的 preempted 请求做 request-level regrouping。
 - 把 “不同 `split_index` 的请求绝不能进入同一个 split-prefill batch”
@@ -118,10 +179,16 @@ predicted remaining prefill time 做调度。
 ### 4. 测试
 
 - 在完整 Python 测试环境下跑通现有 scheduler 单测。
+- 增加一类专门针对 request-owned resume 的测试：
+  单请求 parked req 从 `Req.flowprefill_ctx` 重建 batch，并且不走
+  `prepare_for_extend()` / 不重新分配 KV。
 - 增加集成测试，覆盖：
   长 prefill 被短高优请求打断、从非零 `split_index` 恢复、多个 preempted
   batch 堆积、split-prefill 中 abort、多次 resume 后 finish。
 - 增加不同 `split_index` 的 no-mix regression test。
+- 增加 fallback 测试，验证以下情况不会误走单请求恢复：
+  多请求 parked batch、缺失 `split_forward_batch`、grammar/logprob 等
+  当前仍不支持的路径。
 - 至少对 Llama 和 Qwen 增加 FlowPrefill 开/关的输出等价性测试。
 - 增加资源生命周期测试，显式检查 finish、abort、重复 preempt-resume 之后
   KV/tree-lock/request-pool 是否正确清理。
