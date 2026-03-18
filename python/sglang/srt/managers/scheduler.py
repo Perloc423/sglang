@@ -790,7 +790,7 @@ class Scheduler(
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
-        self.preempted_prefill_queue: Deque[ScheduleBatch] = deque()
+        self.preempted_prefill_queue: Deque[Req] = deque()
         self.running_split_prefill_batch: Optional[ScheduleBatch] = None
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
@@ -1897,6 +1897,14 @@ class Scheduler(
         best_req = min(batch.reqs, key=self._flowprefill_priority_key)
         return (*self._flowprefill_priority_key(best_req), batch.split_index)
 
+    def _flowprefill_preempted_req_priority_key(
+        self, req: Req
+    ) -> Tuple[int, float, int]:
+        return (
+            *self._flowprefill_priority_key(req),
+            req.flowprefill_ctx.split_index,
+        )
+
     def _flowprefill_request_should_preempt(self, req: Req) -> bool:
         if not self.enable_flowprefill or self.running_split_prefill_batch is None:
             return False
@@ -1929,6 +1937,8 @@ class Scheduler(
             batch.mark_flowprefill_preempt_pending()
 
     def _enqueue_preempted_flowprefill_batch(self, batch: ScheduleBatch) -> None:
+        for req in batch.reqs:
+            req.sync_flowprefill_ctx_from_batch(batch)
         self._clear_flowprefill_batch_runtime_state(batch)
         batch.batch_is_full = False
         for req in batch.reqs:
@@ -1943,7 +1953,7 @@ class Scheduler(
             batch.split_index,
             [r.prefill_num_preemptions for r in batch.reqs],
         )
-        self.preempted_prefill_queue.append(batch)
+        self.preempted_prefill_queue.extend(batch.reqs)
 
     def _clear_flowprefill_batch_runtime_state(self, batch: ScheduleBatch) -> None:
         batch.split_prefill_finished = False
@@ -1953,15 +1963,29 @@ class Scheduler(
         if not self.preempted_prefill_queue:
             return None
 
-        best_batch = min(
-            self.preempted_prefill_queue, key=self._flowprefill_batch_priority_key
+        best_req = min(
+            self.preempted_prefill_queue, key=self._flowprefill_preempted_req_priority_key
         )
-        self.preempted_prefill_queue.remove(best_batch)
+        best_batch = best_req.flowprefill_ctx.resume_batch
+        if best_batch is None:
+            self.preempted_prefill_queue.remove(best_req)
+            return None
+
+        sibling_reqs = [
+            req
+            for req in self.preempted_prefill_queue
+            if req.flowprefill_ctx.resume_batch is best_batch
+        ]
+        for req in sibling_reqs:
+            self.preempted_prefill_queue.remove(req)
+        if best_batch.reqs:
+            best_batch.reqs[0].apply_flowprefill_ctx_to_batch(best_batch)
         self._clear_flowprefill_batch_runtime_state(best_batch)
         best_batch.split_attn_backend_needs_reinit = True
         for req in best_batch.reqs:
             req.prefill_state = PrefillState.RUNNING
             req.prefill_resume_split_index = best_batch.split_index
+            req.sync_flowprefill_ctx_from_batch(best_batch)
         logger.info(
             "FlowPrefill: resuming preempted batch "
             "(rids=%s, split_index=%d, queue_remaining=%d)",
@@ -2302,17 +2326,20 @@ class Scheduler(
         self.policy.calc_priority(self.waiting_queue, self.running_batch)
 
         best_waiting_req = self.waiting_queue[0] if self.waiting_queue else None
-        best_preempted_batch = (
-            min(self.preempted_prefill_queue, key=self._flowprefill_batch_priority_key)
+        best_preempted_req = (
+            min(
+                self.preempted_prefill_queue,
+                key=self._flowprefill_preempted_req_priority_key,
+            )
             if self.preempted_prefill_queue
             else None
         )
 
         if best_waiting_req is None:
             return self._pop_next_flowprefill_batch()
-        if best_preempted_batch is None:
+        if best_preempted_req is None:
             return None
-        if self._flowprefill_batch_priority_key(best_preempted_batch)[
+        if self._flowprefill_preempted_req_priority_key(best_preempted_req)[
             :2
         ] < self._flowprefill_priority_key(best_waiting_req):
             return self._pop_next_flowprefill_batch()
@@ -2541,6 +2568,8 @@ class Scheduler(
         if self.enable_flowprefill and new_batch is not None:
             new_batch.prepare_for_split_prefill()
             new_batch.split_forward_count = self.server_args.flowprefill_split_layers
+            for req in new_batch.reqs:
+                req.sync_flowprefill_ctx_from_batch(new_batch)
             self.running_split_prefill_batch = new_batch
 
         return new_batch
@@ -2835,6 +2864,7 @@ class Scheduler(
             for req in batch.reqs:
                 req.prefill_preempt_pending = False
                 req.prefill_state = PrefillState.FINISHED
+                req.reset_flowprefill_ctx()
             batch.split_forward_batch = None
             batch.forward_mode = ForwardMode.EXTEND
             self.process_batch_result_prefill(batch, result)
@@ -2845,6 +2875,7 @@ class Scheduler(
             batch.split_forward_batch = None
             for req in batch.reqs:
                 req.prefill_state = PrefillState.ABORTED
+                req.reset_flowprefill_ctx()
                 if req.to_finish is not None:
                     req.finished_reason = req.to_finish
                     req.to_finish = None
@@ -2854,6 +2885,7 @@ class Scheduler(
 
         for req in batch.reqs:
             req.prefill_resume_split_index = batch.split_index
+            req.sync_flowprefill_ctx_from_batch(batch)
 
         if any(req.prefill_preempt_pending for req in batch.reqs):
             self.running_split_prefill_batch = None
@@ -3229,19 +3261,36 @@ class Scheduler(
         self.grammar_manager.abort_requests(recv_req)
 
         if self.enable_flowprefill and self.preempted_prefill_queue:
-            remaining_batches = deque()
-            for batch in self.preempted_prefill_queue:
+            remaining_reqs = deque()
+            handled_batches = set()
+            for req in self.preempted_prefill_queue:
+                resume_batch = req.flowprefill_ctx.resume_batch
+                batch_id = id(resume_batch) if resume_batch is not None else None
+                if batch_id in handled_batches:
+                    continue
+
+                sibling_reqs = (
+                    resume_batch.reqs if resume_batch is not None else [req]
+                )
                 should_abort = any(
-                    recv_req.abort_all or req.rid.startswith(recv_req.rid)
-                    for req in batch.reqs
+                    recv_req.abort_all or sibling_req.rid.startswith(recv_req.rid)
+                    for sibling_req in sibling_reqs
                 )
                 if should_abort:
-                    for req in batch.reqs:
-                        release_kv_cache(req, self.tree_cache, is_insert=False)
-                        self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+                    for sibling_req in sibling_reqs:
+                        sibling_req.reset_flowprefill_ctx()
+                        release_kv_cache(
+                            sibling_req, self.tree_cache, is_insert=False
+                        )
+                        self.send_to_tokenizer.send_output(
+                            AbortReq(rid=sibling_req.rid), sibling_req
+                        )
                 else:
-                    remaining_batches.append(batch)
-            self.preempted_prefill_queue = remaining_batches
+                    remaining_reqs.extend(sibling_reqs)
+
+                if batch_id is not None:
+                    handled_batches.add(batch_id)
+            self.preempted_prefill_queue = remaining_reqs
 
         # Delete requests not in the waiting queue when PD disaggregation is enabled
         if self.disaggregation_mode == DisaggregationMode.PREFILL:

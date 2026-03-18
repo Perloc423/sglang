@@ -9,6 +9,13 @@ from sglang.test.test_utils import CustomTestCase
 
 
 def make_req(rid: str, priority: int, wait_time: float, split_index: int = 0):
+    flowprefill_ctx = SimpleNamespace(
+        split_index=split_index,
+        split_forward_batch=None,
+        seq_lens_cpu_cache=None,
+        split_attn_backend_needs_reinit=False,
+        resume_batch=None,
+    )
     req = SimpleNamespace()
     req.rid = rid
     req.priority = priority
@@ -20,6 +27,38 @@ def make_req(rid: str, priority: int, wait_time: float, split_index: int = 0):
     req.to_finish = None
     req.finished = lambda: False
     req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
+    req.flowprefill_ctx = flowprefill_ctx
+
+    def sync_flowprefill_ctx_from_batch(batch):
+        req.prefill_resume_split_index = batch.split_index
+        req.flowprefill_ctx.split_index = batch.split_index
+        req.flowprefill_ctx.split_forward_batch = getattr(
+            batch, "split_forward_batch", None
+        )
+        req.flowprefill_ctx.seq_lens_cpu_cache = getattr(batch, "seq_lens_cpu_cache", None)
+        req.flowprefill_ctx.split_attn_backend_needs_reinit = getattr(
+            batch, "split_attn_backend_needs_reinit", False
+        )
+        req.flowprefill_ctx.resume_batch = batch
+
+    def apply_flowprefill_ctx_to_batch(batch):
+        batch.split_index = req.flowprefill_ctx.split_index
+        batch.split_forward_batch = req.flowprefill_ctx.split_forward_batch
+        batch.seq_lens_cpu_cache = req.flowprefill_ctx.seq_lens_cpu_cache
+        batch.split_attn_backend_needs_reinit = (
+            req.flowprefill_ctx.split_attn_backend_needs_reinit
+        )
+
+    def reset_flowprefill_ctx():
+        req.flowprefill_ctx.split_index = 0
+        req.flowprefill_ctx.split_forward_batch = None
+        req.flowprefill_ctx.seq_lens_cpu_cache = None
+        req.flowprefill_ctx.split_attn_backend_needs_reinit = False
+        req.flowprefill_ctx.resume_batch = None
+
+    req.sync_flowprefill_ctx_from_batch = sync_flowprefill_ctx_from_batch
+    req.apply_flowprefill_ctx_to_batch = apply_flowprefill_ctx_to_batch
+    req.reset_flowprefill_ctx = reset_flowprefill_ctx
     return req
 
 
@@ -31,6 +70,9 @@ def make_batch(reqs, split_index: int):
     batch.split_prefill_finished = False
     batch.split_forward_count = 1
     batch.forward_mode = ForwardMode.SPLIT_PREFILL
+    batch.split_forward_batch = None
+    batch.seq_lens_cpu_cache = None
+    batch.split_attn_backend_needs_reinit = False
 
     def mark_flowprefill_preempt_pending():
         for req in reqs:
@@ -82,9 +124,10 @@ class TestFlowPrefillScheduler(CustomTestCase):
         preempted_req = make_req("preempted", priority=5, wait_time=2.0, split_index=2)
         preempted_batch = make_batch([preempted_req], split_index=2)
         preempted_req.prefill_state = PrefillState.PREEMPTED
+        preempted_req.sync_flowprefill_ctx_from_batch(preempted_batch)
 
         self.scheduler.waiting_queue = [waiting_req]
-        self.scheduler.preempted_prefill_queue.append(preempted_batch)
+        self.scheduler.preempted_prefill_queue.append(preempted_req)
 
         selected = self.scheduler._get_next_flowprefill_candidate()
 
@@ -96,9 +139,10 @@ class TestFlowPrefillScheduler(CustomTestCase):
         waiting_req = make_req("waiting", priority=10, wait_time=1.0)
         preempted_req = make_req("preempted", priority=5, wait_time=2.0, split_index=3)
         preempted_batch = make_batch([preempted_req], split_index=3)
+        preempted_req.sync_flowprefill_ctx_from_batch(preempted_batch)
 
         self.scheduler.waiting_queue = [waiting_req]
-        self.scheduler.preempted_prefill_queue.append(preempted_batch)
+        self.scheduler.preempted_prefill_queue.append(preempted_req)
 
         selected = self.scheduler._get_next_flowprefill_candidate()
 

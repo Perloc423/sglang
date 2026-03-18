@@ -224,6 +224,23 @@ class PrefillState(Enum):
     ABORTED = auto()
 
 
+@dataclasses.dataclass
+class FlowPrefillExecCtx:
+    """Request-level resume state for FlowPrefill.
+
+    The current implementation still executes split-prefill through
+    `ScheduleBatch.split_*` fields, but request-level preemption work will move
+    the long-lived resume state onto `Req`. This context is the stable home for
+    that state.
+    """
+
+    split_index: int = 0
+    split_forward_batch: Optional[ForwardBatch] = None
+    seq_lens_cpu_cache: Optional[torch.Tensor] = None
+    split_attn_backend_needs_reinit: bool = False
+    resume_batch: Optional["ScheduleBatch"] = None
+
+
 class MultimodalInputFormat(Enum):
     NORMAL = auto()
     PROCESSOR_OUTPUT = auto()
@@ -812,6 +829,7 @@ class Req(ReqDllmMixin):
         self.prefill_preempt_pending: bool = False
         self.prefill_num_preemptions: int = 0
         self.prefill_resume_split_index: int = 0
+        self.flowprefill_ctx = FlowPrefillExecCtx()
 
         # For diffusion LLM
         self.init_diffusion_llm(dllm_config)
@@ -1152,6 +1170,28 @@ class Req(ReqDllmMixin):
         self.prefill_state = PrefillState.WAITING
         self.prefill_preempt_pending = False
         self.prefill_resume_split_index = 0
+        self.reset_flowprefill_ctx()
+
+    def reset_flowprefill_ctx(self):
+        self.flowprefill_ctx = FlowPrefillExecCtx()
+
+    def sync_flowprefill_ctx_from_batch(self, batch: "ScheduleBatch"):
+        self.prefill_resume_split_index = batch.split_index
+        self.flowprefill_ctx.split_index = batch.split_index
+        self.flowprefill_ctx.split_forward_batch = batch.split_forward_batch
+        self.flowprefill_ctx.seq_lens_cpu_cache = batch.seq_lens_cpu_cache
+        self.flowprefill_ctx.split_attn_backend_needs_reinit = (
+            batch.split_attn_backend_needs_reinit
+        )
+        self.flowprefill_ctx.resume_batch = batch
+
+    def apply_flowprefill_ctx_to_batch(self, batch: "ScheduleBatch"):
+        batch.split_index = self.flowprefill_ctx.split_index
+        batch.split_forward_batch = self.flowprefill_ctx.split_forward_batch
+        batch.seq_lens_cpu_cache = self.flowprefill_ctx.seq_lens_cpu_cache
+        batch.split_attn_backend_needs_reinit = (
+            self.flowprefill_ctx.split_attn_backend_needs_reinit
+        )
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -1807,6 +1847,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for req in self.reqs:
             req.prefill_state = PrefillState.RUNNING
             req.prefill_resume_split_index = self.split_index
+            req.flowprefill_ctx.split_index = self.split_index
 
     def mark_flowprefill_preempt_pending(self):
         for req in self.reqs:
