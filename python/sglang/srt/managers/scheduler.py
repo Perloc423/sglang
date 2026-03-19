@@ -2018,6 +2018,18 @@ class Scheduler(
             )
         return parked_duration_seconds
 
+    def _set_running_split_prefill_batch(
+        self, batch: ScheduleBatch, *, resume_mode: str
+    ) -> None:
+        self.running_split_prefill_batch = batch
+        logger.info(
+            "FlowPrefill: starting split-prefill batch "
+            "(rids=%s, split_index=%d, resume_mode=%s)",
+            [r.rid for r in batch.reqs],
+            batch.split_index,
+            resume_mode,
+        )
+
     def _maybe_mark_flowprefill_preempt_pending(self, req: Req) -> None:
         if self._flowprefill_request_should_preempt(req):
             batch = self.running_split_prefill_batch
@@ -2562,7 +2574,9 @@ class Scheduler(
         if self.enable_flowprefill:
             resumed_batch = self._get_next_flowprefill_candidate()
             if resumed_batch is not None:
-                self.running_split_prefill_batch = resumed_batch
+                self._set_running_split_prefill_batch(
+                    resumed_batch, resume_mode="resumed"
+                )
                 return resumed_batch
 
         if self.enable_priority_preemption:
@@ -2772,7 +2786,9 @@ class Scheduler(
             new_batch.split_forward_count = self.server_args.flowprefill_split_layers
             for req in new_batch.reqs:
                 req.sync_flowprefill_ctx_from_batch(new_batch)
-            self.running_split_prefill_batch = new_batch
+            self._set_running_split_prefill_batch(
+                new_batch, resume_mode="new_request"
+            )
 
         return new_batch
 

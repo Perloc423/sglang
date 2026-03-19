@@ -108,6 +108,8 @@ With `--schedule-low-priority-values-first`, smaller priority integers are consi
 - Increase `--flowprefill-split-layers` if scheduler overhead becomes noticeable.
 - Use `--flowprefill-max-preemptions` to prevent very long prompts from being repeatedly pushed back under sustained high-priority traffic.
 - Keep `--enable-priority-scheduling` aligned with your client-side priority semantics; FlowPrefill only helps when the scheduler can distinguish urgent requests.
+- For the current single-request preemption/resume path, start with
+  `--max-running-requests 2` rather than `1`.
 
 ## Limitations
 
@@ -118,6 +120,12 @@ With `--schedule-low-priority-values-first`, smaller priority integers are consi
 - The current resume path is still transitional:
   single-request parked prefills may resume from request-owned state, but
   multi-request parked prefills still fall back to parked-batch resume.
+- In the current implementation, do not rely on `--max-running-requests 1`
+  for cooperative preemption workloads. In the validated `Qwen3-30B-A3B`
+  single-request resume path, the urgent request may still need a fresh req
+  slot after the background prefill is parked; using `--max-running-requests 1`
+  can therefore fail in `alloc_req_slots()`. Use at least
+  `--max-running-requests 2` for this class of workload.
 - The request-owned single-request resume path is currently limited to a safe subset.
   Requests using grammar constraints, `input_embeds`, multimodal inputs, or
   encoder-decoder models fall back to parked-batch resume instead of taking the

@@ -24,10 +24,15 @@ layer-level MVP 与论文
 - 单请求 parked req 已支持一条真实的 request-owned resume 路径：
   在满足安全 guard 时，不再依赖 `resume_batch`，而是直接从
   `Req.flowprefill_ctx` 重建单请求 `ScheduleBatch`。
+- 单请求 request-owned resume 已支持 `return_logprob`，
+  不再因 logprob 路径退回 parked-batch resume。
 - 多请求 parked batch 目前仍通过 `resume_batch` 兼容恢复；
   这是一层显式过渡，不是最终设计。
 - 单请求 request-owned resume 的 guard 和 fallback reason 已显式化，
   便于后续逐步放宽支持范围。
+- 已补一轮初始可观测性：
+  有结构化日志区分 single-request resume / parked-batch fallback，
+  并已有 parked queue、resume depth、fallback reason 等指标。
 
 当前还没有做到的关键点：
 
@@ -38,47 +43,61 @@ layer-level MVP 与论文
 - 其中 `input_embeds`、grammar、multimodal 已转入未来兼容性规划，
   不再作为近期实现优先项。
 - 单请求恢复真实性虽已在 `Qwen3-30B-A3B` 上完成一轮验证，但还缺少
-  更系统的自动化测试与跨模型验证覆盖。
+  更系统的自动化测试覆盖。
+- 在 `Qwen3-30B-A3B` 的当前实现上，单请求 FlowPrefill 抢占/恢复路径
+  不能安全依赖 `--max-running-requests 1`：
+  抢占后若 urgent 请求仍需新分配 req slot，scheduler 会在
+  `alloc_req_slots()` 阶段失败；当前验证和测试应至少使用
+  `--max-running-requests 2`。
 - 还没有接入 slack-aware scheduling，也没有引入 remaining-time predictor。
+- 多请求 parked req 仍未进入真正的 request-level resume，
+  当前 `resume batch has multiple requests` 仍是主要 fallback 来源。
 
 ## 下一步具体任务
 
-建议下一轮按下面顺序推进；当前决定先跳过“补自动化测试 / 第二模型验证”，
-优先做可观测性和 guard 边界清理：
+建议下一轮按下面顺序推进；当前可观测性和 `return_logprob`
+单请求恢复已落地，下一步优先收口测试、近期 guard 边界，以及最小化的
+多请求 request-level resume：
 
-### P0：先补可观测性，收集后续决策所需信号
+### P0：先用实现期日志验收补护栏，再决定哪些约束进入自动化测试
 
-- 补充单请求恢复时的日志和指标：
-  记录是否走 request-owned resume、是否 fallback、fallback reason。
-- 增加队列与恢复深度观测：
-  `preempted_prefill_queue` 长度、resume depth（`split_index`）、
-  每请求 preemption 次数、preemption latency。
-- 输出足够结构化的信息，能够复盘：
-  arrival -> mark preempt pending -> preempted -> resumed -> finished/aborted。
-
-### P1：清理单请求恢复的 guard 边界
-
-- 近期只审计 `encoder-decoder` 是否真的是硬限制。
-- `input_embeds`、grammar、multimodal 暂时不做，转入未来兼容性规划。
-- 对短期内不准备支持的限制，在用户文档和日志里继续明确说明。
-
-### P2：回补单请求 request-owned resume 的自动化验证
-
-- 增加一个更贴近真实实现的测试，验证单请求恢复路径不会回到
+- 当前阶段先不要为这些 FlowPrefill 语义约束补单测。
+- 实现阶段优先通过临时结构化日志验证关键语义：
+  单请求恢复不会回到 `prepare_for_extend()`、不会重新分配 req slot /
+  KV、恢复后的 forward 能从非零 `split_index` 继续。
+- 这类验证日志仅作为开发期验收手段使用；功能验收通过后应删除或回收为
+  必要的长期 observability，不保留一次性调试日志。
+- 在真正进入稳定化/回归收口阶段之前，再决定是否把其中一部分约束沉淀为
+  自动化测试。
+- 增加一个更贴近真实实现的日志验收项，验证单请求恢复路径不会回到
   `prepare_for_extend()`，也不会重新分配 KV。
 - `Qwen3-30B-A3B` 已完成一轮单请求恢复真实性验证：
   恢复后的 forward 能从 `split_index > 0` 继续。
-- 后续补齐自动化验证：
-  至少再覆盖一类 Llama 模型，并把“非零 `split_index` 恢复”收进集成测试。
+- 后续先补齐实现期日志验收：
+  以 `Qwen3-30B-A3B` 为准，确认“非零 `split_index` 恢复”在真实运行中稳定成立。
+- 补一条回归约束：
+  当前 `Qwen3-30B-A3B` 验证场景下不要使用 `--max-running-requests 1`，
+  否则 urgent 请求可能在抢占后因 req slot 不足触发
+  `alloc_req_slots()` 失败。
+- 为刚落地的 observability 补最小日志验收项：
+  single-request resume、parked-batch fallback、fallback reason、resume depth。
 
-### P3：开始做真正的多请求 request-level resume
+### P1：清理近期需要的 guard 边界
+
+- `encoder-decoder` 近期也不做，转入未来兼容性规划。
+- `input_embeds`、grammar、multimodal 暂时不做，转入未来兼容性规划。
+- 对短期内不准备支持的限制，在用户文档和日志里继续明确说明。
+
+### P2：开始做真正的多请求 request-level resume 的最小版本
 
 - 去掉“多请求 parked batch 依赖 `resume_batch` 恢复”的兼容层。
 - 先支持最保守版本：
   只允许相同 `split_index` 的 preempted req 单独恢复，不做 regroup。
-- 然后再做下一步：
-  支持相同 `split_index` 的多个 req regroup，继续禁止不同 `split_index`
-  混批。
+
+### P3：支持同 `split_index` 的 regroup
+
+- 在完成最小版本后，再支持相同 `split_index` 的多个 req regroup。
+- 继续禁止不同 `split_index` 混批，并把 no-mix 约束固化到测试。
 
 ### P4：为后续 slack-aware scheduling 预留接口
 
@@ -89,6 +108,8 @@ layer-level MVP 与论文
 
 ### Future：兼容性扩展规划
 
+- 未来再评估单请求 request-owned resume 对 `encoder-decoder` 的支持，
+  重点检查 encoder cache、decoder KV、以及 split-prefill resume 之间的状态一致性。
 - 未来再评估单请求 request-owned resume 对 `input_embeds` 的支持，
   重点检查恢复后输入 embedding 与 KV / cache index 的一致性。
 - 未来再评估 grammar-constrained request 的支持，
@@ -103,6 +124,8 @@ layer-level MVP 与论文
 - 完整调度只在真正有意义的事件上触发。
 - 先把 resume 语义做正确、做便宜，再去做更细粒度抢占点。
 - 评估不应只看吞吐，还要看 TTFT SLO 达成率与 goodput。
+- 当前实现阶段优先接受“临时日志验证 + 验收后删除”的方式来验证恢复语义，
+  避免过早在快速迭代期绑定脆弱测试。
 
 ## 逻辑框架图
 
@@ -202,6 +225,9 @@ predicted remaining prefill time 做调度。
 ### 4. 测试
 
 - 在完整 Python 测试环境下跑通现有 scheduler 单测。
+- 当前已补单测覆盖：
+  single-request request-owned resume、parked-batch fallback resume、
+  fallback reason、`return_logprob` 单请求恢复。
 - 增加一类专门针对 request-owned resume 的测试：
   单请求 parked req 从 `Req.flowprefill_ctx` 重建 batch，并且不走
   `prepare_for_extend()` / 不重新分配 KV。
@@ -219,12 +245,13 @@ predicted remaining prefill time 做调度。
 
 ### 5. 可观测性
 
-- 增加指标和日志：
-  preempted prefill 请求数、resumed 请求数、`preempted_prefill_queue`
-  当前长度、resume depth（`split_index`）、每请求 preemption 次数、
-  preemption latency。
-- 输出足够结构化的信息，能够复盘：
-  arrival -> mark preempt pending -> preempted -> resumed -> finished/aborted。
+- 当前已补首轮指标和日志：
+  preempted / resumed / fallback 计数、`preempted_prefill_queue`
+  当前长度、resume depth（`split_index`）、parked duration，
+  以及区分 single-request resume / parked-batch fallback 的结构化日志。
+- 下一步补足仍欠缺的项：
+  每请求 preemption 次数、preemption latency 的最终口径，以及更完整的
+  事件链回放。
 - 如果长期维持 batch-level resume，需要重新审视命名，避免把当前能力表述成
   完整的 request-level FlowPrefill。
 
