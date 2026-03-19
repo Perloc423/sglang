@@ -50,7 +50,9 @@ def make_req(rid: str, priority: int, wait_time: float, split_index: int = 0):
         req.flowprefill_ctx.split_forward_batch = getattr(
             batch, "split_forward_batch", None
         )
-        req.flowprefill_ctx.seq_lens_cpu_cache = getattr(batch, "seq_lens_cpu_cache", None)
+        req.flowprefill_ctx.seq_lens_cpu_cache = getattr(
+            batch, "seq_lens_cpu_cache", None
+        )
         req.flowprefill_ctx.split_attn_backend_needs_reinit = getattr(
             batch, "split_attn_backend_needs_reinit", False
         )
@@ -120,6 +122,9 @@ class TestFlowPrefillScheduler(CustomTestCase):
                 key=self.scheduler._flowprefill_priority_key
             )
         )
+        self.scheduler.current_scheduler_metrics_enabled = False
+        self.scheduler.metrics_collector = MagicMock()
+        self.scheduler.stats = SimpleNamespace(num_preempted_prefill_queue_reqs=0)
         self.scheduler.waiting_queue = []
         self.scheduler.running_batch = SimpleNamespace(reqs=[])
         self.scheduler.preempted_prefill_queue = deque()
@@ -246,6 +251,32 @@ class TestFlowPrefillScheduler(CustomTestCase):
         init_resume.assert_called_once()
         self.assertEqual(req.prefill_state, PrefillState.RUNNING)
 
+    def test_single_request_resume_records_metrics(self):
+        req = make_req("r0", priority=5, wait_time=1.0, split_index=2)
+        req.prefill_state = PrefillState.PREEMPTED
+        req.flowprefill_ctx.split_forward_batch = SimpleNamespace()
+        req.flowprefill_ctx.preempted_at = 10.0
+        resumed_batch = make_batch([req], split_index=2)
+        self.scheduler.current_scheduler_metrics_enabled = True
+        self.scheduler.preempted_prefill_queue.append(req)
+
+        with patch.object(
+            ScheduleBatch,
+            "init_single_req_from_flowprefill_ctx",
+            return_value=resumed_batch,
+        ), patch("sglang.srt.managers.scheduler.time.perf_counter", return_value=12.0):
+            selected = self.scheduler._get_next_flowprefill_candidate()
+
+        self.assertIs(selected, resumed_batch)
+        self.scheduler.metrics_collector.increment_flowprefill_resumed_requests.assert_called_once_with(
+            1, "single_request"
+        )
+        self.scheduler.metrics_collector.observe_flowprefill_resume.assert_called_once_with(
+            resume_mode="single_request",
+            split_index=2,
+            parked_duration_seconds=2.0,
+        )
+
     def test_single_req_resume_restores_prefill_stats_from_request_ctx(self):
         req = make_req("r0", priority=5, wait_time=1.0, split_index=2)
         req.flowprefill_ctx.split_forward_batch = SimpleNamespace(
@@ -294,6 +325,87 @@ class TestFlowPrefillScheduler(CustomTestCase):
 
         self.assertIs(batch.prefill_stats, req.flowprefill_ctx.prefill_stats)
 
+    def test_single_req_resume_supports_return_logprob(self):
+        req = make_req("r0", priority=5, wait_time=1.0, split_index=2)
+        req.return_logprob = True
+        req.logprob_start_len = 1
+        req.origin_input_ids = [11, 12, 13, 14]
+        req.fill_ids = [11, 12, 13, 14]
+        req.prefix_indices = [0, 1]
+        req.extend_input_len = 2
+        req.extend_logprob_start_len = 2
+        req.top_logprobs_num = 3
+        req.token_ids_logprob = [7, 8]
+        req.flowprefill_ctx.split_forward_batch = SimpleNamespace(
+            input_ids=None,
+            req_pool_indices=None,
+            seq_lens=None,
+            seq_lens_cpu=None,
+            orig_seq_lens=None,
+            out_cache_loc=None,
+            seq_lens_sum=0,
+            encoder_out_cache_loc=None,
+            input_embeds=None,
+            token_type_ids=None,
+            mamba_track_indices=None,
+            mamba_track_mask=None,
+            mamba_track_seqlens=None,
+        )
+
+        with patch.object(
+            ScheduleBatch, "prepare_for_split_prefill", autospec=True
+        ), patch(
+            "sglang.srt.managers.schedule_batch.SamplingBatchInfo.from_schedule_batch",
+            return_value=SimpleNamespace(),
+        ):
+            batch = ScheduleBatch.init_single_req_from_flowprefill_ctx(
+                req,
+                req_to_token_pool=SimpleNamespace(device="cpu"),
+                token_to_kv_pool_allocator=SimpleNamespace(),
+                tree_cache=SimpleNamespace(),
+                model_config=SimpleNamespace(vocab_size=32000),
+                enable_overlap=False,
+                spec_algorithm=None,
+            )
+
+        self.assertTrue(batch.return_logprob)
+        self.assertEqual(batch.top_logprobs_nums, [3])
+        self.assertEqual(batch.token_ids_logprobs, [[7, 8]])
+        self.assertEqual(batch.extend_input_logprob_token_ids.tolist(), [13, 14])
+
+    def test_fallback_batch_resume_records_reason_and_metrics(self):
+        req0 = make_req("r0", priority=5, wait_time=1.0, split_index=2)
+        req1 = make_req("r1", priority=4, wait_time=2.0, split_index=2)
+        batch = make_batch([req0, req1], split_index=2)
+        batch.split_forward_batch = SimpleNamespace()
+        req0.prefill_state = PrefillState.PREEMPTED
+        req1.prefill_state = PrefillState.PREEMPTED
+        req0.flowprefill_ctx.preempted_at = 20.0
+        req1.flowprefill_ctx.preempted_at = 21.0
+        req0.sync_flowprefill_ctx_from_batch(batch)
+        req1.sync_flowprefill_ctx_from_batch(batch)
+        self.scheduler.current_scheduler_metrics_enabled = True
+        self.scheduler.preempted_prefill_queue.append(req0)
+        self.scheduler.preempted_prefill_queue.append(req1)
+
+        with patch(
+            "sglang.srt.managers.scheduler.time.perf_counter", return_value=25.0
+        ):
+            selected = self.scheduler._get_next_flowprefill_candidate()
+
+        self.assertIs(selected, batch)
+        self.scheduler.metrics_collector.increment_flowprefill_resume_fallback.assert_called_once_with(
+            "resume batch has multiple requests"
+        )
+        self.scheduler.metrics_collector.increment_flowprefill_resumed_requests.assert_called_once_with(
+            2, "parked_batch_fallback"
+        )
+        self.scheduler.metrics_collector.observe_flowprefill_resume.assert_called_once_with(
+            resume_mode="parked_batch_fallback",
+            split_index=2,
+            parked_duration_seconds=5.0,
+        )
+
     def test_single_req_resume_guard_rejects_multi_req_parked_batch(self):
         req0 = make_req("r0", priority=5, wait_time=1.0, split_index=2)
         req1 = make_req("r1", priority=4, wait_time=2.0, split_index=2)
@@ -312,6 +424,16 @@ class TestFlowPrefillScheduler(CustomTestCase):
         reason = self.scheduler._get_flowprefill_single_req_resume_guard_failure(req)
 
         self.assertEqual(reason, "missing split_forward_batch")
+
+    def test_single_req_resume_guard_allows_return_logprob(self):
+        req = make_req("r0", priority=5, wait_time=1.0, split_index=2)
+        req.return_logprob = True
+        req.flowprefill_ctx.split_forward_batch = SimpleNamespace()
+        req.flowprefill_ctx.resume_batch = None
+
+        reason = self.scheduler._get_flowprefill_single_req_resume_guard_failure(req)
+
+        self.assertIsNone(reason)
 
     def test_split_prefill_uses_forward_progress_for_completion(self):
         req = make_req("r0", priority=5, wait_time=1.0, split_index=2)

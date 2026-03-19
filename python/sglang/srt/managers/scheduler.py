@@ -1969,24 +1969,79 @@ class Scheduler(
             < self._flowprefill_batch_priority_key(batch)[:2]
         )
 
+    def _flowprefill_queue_length(self) -> int:
+        return len(self.preempted_prefill_queue) if self.enable_flowprefill else 0
+
+    def _update_flowprefill_queue_stats(self) -> None:
+        if hasattr(self, "stats"):
+            self.stats.num_preempted_prefill_queue_reqs = (
+                self._flowprefill_queue_length()
+            )
+
+    def _record_flowprefill_resume_fallback(self, reason: str) -> None:
+        if getattr(self, "current_scheduler_metrics_enabled", False):
+            self.metrics_collector.increment_flowprefill_resume_fallback(reason)
+
+    def _record_flowprefill_preempted_batch(self, batch: ScheduleBatch) -> None:
+        self._update_flowprefill_queue_stats()
+        if getattr(self, "current_scheduler_metrics_enabled", False):
+            self.metrics_collector.increment_flowprefill_preempted_requests(
+                len(batch.reqs)
+            )
+
+    def _record_flowprefill_resume(
+        self,
+        reqs: List[Req],
+        *,
+        resume_mode: str,
+        split_index: int,
+    ) -> Optional[float]:
+        parked_latencies = []
+        now = time.perf_counter()
+        for req in reqs:
+            parked_at = req.flowprefill_ctx.preempted_at
+            if parked_at is not None:
+                parked_latencies.append(max(0.0, now - parked_at))
+            req.flowprefill_ctx.preempted_at = None
+            req.flowprefill_ctx.preempt_pending_since = None
+
+        parked_duration_seconds = max(parked_latencies) if parked_latencies else None
+        self._update_flowprefill_queue_stats()
+        if getattr(self, "current_scheduler_metrics_enabled", False):
+            self.metrics_collector.increment_flowprefill_resumed_requests(
+                len(reqs), resume_mode
+            )
+            self.metrics_collector.observe_flowprefill_resume(
+                resume_mode=resume_mode,
+                split_index=split_index,
+                parked_duration_seconds=parked_duration_seconds,
+            )
+        return parked_duration_seconds
+
     def _maybe_mark_flowprefill_preempt_pending(self, req: Req) -> None:
         if self._flowprefill_request_should_preempt(req):
             batch = self.running_split_prefill_batch
+            now = time.perf_counter()
+            for running_req in batch.reqs:
+                running_req.flowprefill_ctx.preempt_pending_since = now
             logger.info(
                 "FlowPrefill: marking preempt-pending on batch "
-                "(rids=%s, split_index=%d) triggered by req %s (priority=%s)",
+                "(rids=%s, split_index=%d, trigger_rid=%s, trigger_priority=%s, queue_len=%d)",
                 [r.rid for r in batch.reqs],
                 batch.split_index,
                 req.rid,
                 req.priority,
+                self._flowprefill_queue_length(),
             )
             batch.mark_flowprefill_preempt_pending()
 
     def _enqueue_preempted_flowprefill_batch(self, batch: ScheduleBatch) -> None:
+        now = time.perf_counter()
         for req in batch.reqs:
             req.sync_flowprefill_ctx_from_batch(batch)
             if len(batch.reqs) == 1:
                 req.flowprefill_ctx.resume_batch = None
+            req.flowprefill_ctx.preempted_at = now
         self._clear_flowprefill_batch_runtime_state(batch)
         batch.batch_is_full = False
         for req in batch.reqs:
@@ -1996,12 +2051,14 @@ class Scheduler(
             req.prefill_state = PrefillState.PREEMPTED
         logger.info(
             "FlowPrefill: preempted batch enqueued "
-            "(rids=%s, split_index=%d, preemptions=%s)",
+            "(rids=%s, split_index=%d, preemptions=%s, queue_len=%d)",
             [r.rid for r in batch.reqs],
             batch.split_index,
             [r.prefill_num_preemptions for r in batch.reqs],
+            len(self.preempted_prefill_queue) + len(batch.reqs),
         )
         self.preempted_prefill_queue.extend(batch.reqs)
+        self._record_flowprefill_preempted_batch(batch)
 
     def _clear_flowprefill_batch_runtime_state(self, batch: ScheduleBatch) -> None:
         batch.split_prefill_finished = False
@@ -2029,8 +2086,6 @@ class Scheduler(
             return "missing split_forward_batch"
         if resume_batch is not None and len(resume_batch.reqs) != 1:
             return "resume batch has multiple requests"
-        if req.return_logprob:
-            return "return_logprob is enabled"
         if req.grammar is not None:
             return "grammar-constrained request"
         if req.input_embeds is not None:
@@ -2049,7 +2104,8 @@ class Scheduler(
             return None
 
         best_req = min(
-            self.preempted_prefill_queue, key=self._flowprefill_preempted_req_priority_key
+            self.preempted_prefill_queue,
+            key=self._flowprefill_preempted_req_priority_key,
         )
         single_req_resume_failure = (
             self._get_flowprefill_single_req_resume_guard_failure(best_req)
@@ -2067,14 +2123,25 @@ class Scheduler(
                 self.enable_overlap,
                 self.spec_algorithm,
             )
+            parked_duration_seconds = self._record_flowprefill_resume(
+                [best_req],
+                resume_mode="single_request",
+                split_index=best_batch.split_index,
+            )
             logger.info(
                 "FlowPrefill: resuming single parked request "
-                "(rid=%s, split_index=%d, queue_remaining=%d)",
+                "(rid=%s, split_index=%d, queue_remaining=%d, parked_ms=%s, resume_mode=single_request)",
                 best_req.rid,
                 best_batch.split_index,
                 len(self.preempted_prefill_queue),
+                (
+                    f"{parked_duration_seconds * 1000.0:.3f}"
+                    if parked_duration_seconds is not None
+                    else "unknown"
+                ),
             )
             return best_batch
+        self._record_flowprefill_resume_fallback(single_req_resume_failure)
         logger.debug(
             "FlowPrefill: falling back to parked batch resume for req %s "
             "(reason=%s, split_index=%d)",
@@ -2109,12 +2176,23 @@ class Scheduler(
             req.prefill_state = PrefillState.RUNNING
             req.prefill_resume_split_index = best_batch.split_index
             req.sync_flowprefill_ctx_from_batch(best_batch)
+        parked_duration_seconds = self._record_flowprefill_resume(
+            best_batch.reqs,
+            resume_mode="parked_batch_fallback",
+            split_index=best_batch.split_index,
+        )
         logger.info(
             "FlowPrefill: resuming preempted batch "
-            "(rids=%s, split_index=%d, queue_remaining=%d)",
+            "(rids=%s, split_index=%d, queue_remaining=%d, parked_ms=%s, resume_mode=parked_batch_fallback, fallback_reason=%s)",
             [r.rid for r in best_batch.reqs],
             best_batch.split_index,
             len(self.preempted_prefill_queue),
+            (
+                f"{parked_duration_seconds * 1000.0:.3f}"
+                if parked_duration_seconds is not None
+                else "unknown"
+            ),
+            single_req_resume_failure,
         )
         return best_batch
 
@@ -2581,8 +2659,9 @@ class Scheduler(
                     self.running_batch.batch_is_full = True
 
             if self.running_batch.batch_is_full:
-                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-                    req, self.server_args
+                if (
+                    not self.enable_priority_preemption
+                    or not adder.preempt_to_schedule(req, self.server_args)
                 ):
                     break
 
@@ -3402,9 +3481,7 @@ class Scheduler(
                 if batch_id in handled_batches:
                     continue
 
-                sibling_reqs = (
-                    resume_batch.reqs if resume_batch is not None else [req]
-                )
+                sibling_reqs = resume_batch.reqs if resume_batch is not None else [req]
                 should_abort = any(
                     recv_req.abort_all or sibling_req.rid.startswith(recv_req.rid)
                     for sibling_req in sibling_reqs
@@ -3412,9 +3489,7 @@ class Scheduler(
                 if should_abort:
                     for sibling_req in sibling_reqs:
                         sibling_req.reset_flowprefill_ctx()
-                        release_kv_cache(
-                            sibling_req, self.tree_cache, is_insert=False
-                        )
+                        release_kv_cache(sibling_req, self.tree_cache, is_insert=False)
                         self.send_to_tokenizer.send_output(
                             AbortReq(rid=sibling_req.rid), sibling_req
                         )

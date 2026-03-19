@@ -88,6 +88,7 @@ class SchedulerStats:
     gen_throughput: float = 0.0
     num_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_grammar_queue_reqs: int = 0
+    num_preempted_prefill_queue_reqs: int = 0
     num_running_reqs_offline_batch: int = 0
     cache_hit_rate: float = 0.0
 
@@ -248,6 +249,12 @@ class SchedulerMetricsCollector:
         self.num_grammar_queue_reqs = Gauge(
             name="sglang:num_grammar_queue_reqs",
             documentation="The number of requests in the grammar waiting queue.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.num_preempted_prefill_queue_reqs = Gauge(
+            name="sglang:num_preempted_prefill_queue_reqs",
+            documentation="The number of requests parked in the FlowPrefill preempted queue.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -456,6 +463,33 @@ class SchedulerMetricsCollector:
                 2500,
                 3000,
             ],
+        )
+        self.flowprefill_preempted_requests_total = Counter(
+            name="sglang:flowprefill_preempted_requests_total",
+            documentation="Total number of requests parked by FlowPrefill cooperative preemption.",
+            labelnames=labels.keys(),
+        )
+        self.flowprefill_resumed_requests_total = Counter(
+            name="sglang:flowprefill_resumed_requests_total",
+            documentation="Total number of requests resumed from the FlowPrefill parked queue.",
+            labelnames=list(labels.keys()) + ["resume_mode"],
+        )
+        self.flowprefill_resume_fallback_total = Counter(
+            name="sglang:flowprefill_resume_fallback_total",
+            documentation="Total number of FlowPrefill single-request resume fallbacks by reason.",
+            labelnames=list(labels.keys()) + ["reason"],
+        )
+        self.flowprefill_resume_depth = Histogram(
+            name="sglang:flowprefill_resume_depth",
+            documentation="Histogram of FlowPrefill resume depth measured by split_index.",
+            labelnames=list(labels.keys()) + ["resume_mode"],
+            buckets=(0, 1, 2, 4, 8, 16, 32, 64, 128),
+        )
+        self.flowprefill_parked_duration_seconds = Histogram(
+            name="sglang:flowprefill_parked_duration_seconds",
+            documentation="Histogram of time spent parked in the FlowPrefill preempted queue before resume.",
+            labelnames=list(labels.keys()) + ["resume_mode"],
+            buckets=exponential_buckets(start=0.001, width=2.0, length=18),
         )
 
         # Grammar metrics
@@ -943,6 +977,10 @@ class SchedulerMetricsCollector:
         self._log_gauge_queue_count(self.num_queue_reqs, stats.num_queue_reqs)
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
         self._log_gauge(
+            self.num_preempted_prefill_queue_reqs,
+            stats.num_preempted_prefill_queue_reqs,
+        )
+        self._log_gauge(
             self.num_running_reqs_offline_batch, stats.num_running_reqs_offline_batch
         )
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
@@ -1015,6 +1053,36 @@ class SchedulerMetricsCollector:
         )
 
         self.last_log_time = time.perf_counter()
+
+    def increment_flowprefill_preempted_requests(self, value: int) -> None:
+        self.flowprefill_preempted_requests_total.labels(**self.labels).inc(value)
+
+    def increment_flowprefill_resumed_requests(
+        self, value: int, resume_mode: str
+    ) -> None:
+        self.flowprefill_resumed_requests_total.labels(
+            **self.labels, resume_mode=resume_mode
+        ).inc(value)
+
+    def increment_flowprefill_resume_fallback(self, reason: str) -> None:
+        self.flowprefill_resume_fallback_total.labels(
+            **self.labels, reason=reason
+        ).inc()
+
+    def observe_flowprefill_resume(
+        self,
+        *,
+        resume_mode: str,
+        split_index: int,
+        parked_duration_seconds: Optional[float] = None,
+    ) -> None:
+        self.flowprefill_resume_depth.labels(
+            **self.labels, resume_mode=resume_mode
+        ).observe(split_index)
+        if parked_duration_seconds is not None:
+            self.flowprefill_parked_duration_seconds.labels(
+                **self.labels, resume_mode=resume_mode
+            ).observe(parked_duration_seconds)
 
     def log_grammar_stats(self, grammar_stats) -> None:
         if grammar_stats.compilation_time is not None:

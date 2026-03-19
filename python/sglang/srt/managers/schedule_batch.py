@@ -240,6 +240,8 @@ class FlowPrefillExecCtx:
     split_attn_backend_needs_reinit: bool = False
     prefill_stats: Optional["PrefillStats"] = None
     resume_batch: Optional["ScheduleBatch"] = None
+    preempt_pending_since: Optional[float] = None
+    preempted_at: Optional[float] = None
 
 
 class MultimodalInputFormat(Enum):
@@ -857,9 +859,9 @@ class Req(ReqDllmMixin):
 
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""
-        assert not self.kv_committed_freed, (
-            f"Committed KV cache already freed ({self.kv_committed_len=})"
-        )
+        assert (
+            not self.kv_committed_freed
+        ), f"Committed KV cache already freed ({self.kv_committed_len=})"
         self.kv_committed_freed = True
         return self.kv_committed_len
 
@@ -869,9 +871,9 @@ class Req(ReqDllmMixin):
         # NOTE: This function is called when there is over-allocation of KV cache.
         # Over-allocation: we allocate more KV cache than the committed length.
         # e.g., speculative decoding may allocate more KV cache than actually used.
-        assert not self.kv_overallocated_freed, (
-            f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
-        )
+        assert (
+            not self.kv_overallocated_freed
+        ), f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
         self.kv_overallocated_freed = True
         return self.kv_committed_len, self.kv_allocated_len
 
@@ -1457,6 +1459,36 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         is_hybrid_swa = isinstance(
             token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
         )
+        extend_input_logprob_token_ids = None
+        if req.return_logprob:
+            global_start_idx, global_end_idx = (
+                len(req.prefix_indices),
+                len(req.fill_ids),
+            )
+            if req.logprob_start_len == -1:
+                logprob_start_len = len(req.origin_input_ids)
+            else:
+                logprob_start_len = req.logprob_start_len
+            if global_start_idx < logprob_start_len:
+                global_start_idx = logprob_start_len
+
+            logprob_token_ids = req.origin_input_ids[
+                global_start_idx + 1 : global_end_idx + 1
+            ]
+            extend_input_logprob_token_ids = list(logprob_token_ids)
+            extend_input_logprob_token_ids.extend(
+                [0]
+                * (
+                    req.extend_input_len
+                    - req.extend_logprob_start_len
+                    - len(logprob_token_ids)
+                )
+            )
+            extend_input_logprob_token_ids = torch.tensor(
+                extend_input_logprob_token_ids
+            )
+            extend_input_logprob_token_ids.clamp_(0, model_config.vocab_size - 1)
+
         batch = cls(
             reqs=[req],
             req_to_token_pool=req_to_token_pool,
@@ -1505,6 +1537,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_mask=forward_batch.mamba_track_mask,
             mamba_track_seqlens=forward_batch.mamba_track_seqlens,
             prefill_stats=req.flowprefill_ctx.prefill_stats,
+            extend_input_logprob_token_ids=extend_input_logprob_token_ids,
         )
         batch.top_logprobs_nums = [req.top_logprobs_num] if req.return_logprob else None
         batch.token_ids_logprobs = (
@@ -1598,9 +1631,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
 
-        assert len(self.out_cache_loc) == self.extend_num_tokens, (
-            f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
-        )
+        assert (
+            len(self.out_cache_loc) == self.extend_num_tokens
+        ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
@@ -2086,7 +2119,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         new_estimate_ratio = (
             total_decoded_tokens
             + envs.SGLANG_RETRACT_DECODE_STEPS.get() * len(self.reqs)
-        ) / (total_max_new_tokens + 1)  # avoid zero division
+        ) / (
+            total_max_new_tokens + 1
+        )  # avoid zero division
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
@@ -2520,9 +2555,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         sliding_window_size = self.tree_cache.sliding_window_size
 
         # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
-        assert req.cache_protected_len % self.tree_cache.page_size == 0, (
-            "cache_protected_len must be page aligned"
-        )
+        assert (
+            req.cache_protected_len % self.tree_cache.page_size == 0
+        ), "cache_protected_len must be page aligned"
         req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
 
         new_swa_evicted_seqlen = max(

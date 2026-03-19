@@ -33,31 +33,45 @@ layer-level MVP 与论文
 
 - 多请求 preempted req 的真正 regroup 仍未实现。
 - 单请求 request-owned resume 仍只对安全子集开放：
-  非 logprob、非 grammar、非 multimodal、非 input_embeds、非
+  非 grammar、非 multimodal、非 input_embeds、非
   encoder-decoder 等。
+- 其中 `input_embeds`、grammar、multimodal 已转入未来兼容性规划，
+  不再作为近期实现优先项。
+- 单请求恢复真实性虽已在 `Qwen3-30B-A3B` 上完成一轮验证，但还缺少
+  更系统的自动化测试与跨模型验证覆盖。
 - 还没有接入 slack-aware scheduling，也没有引入 remaining-time predictor。
 
 ## 下一步具体任务
 
-建议下一轮严格按下面顺序推进，不要并行扩散：
+建议下一轮按下面顺序推进；当前决定先跳过“补自动化测试 / 第二模型验证”，
+优先做可观测性和 guard 边界清理：
 
-### P0：把单请求 request-owned resume 跑实
+### P0：先补可观测性，收集后续决策所需信号
 
-- 增加一个更贴近真实实现的测试，验证单请求恢复路径不会回到
-  `prepare_for_extend()`，也不会重新分配 KV。
-- 对 Llama / Qwen 的 split-prefill 路径做至少一轮手工或集成验证，
-  确认单请求恢复后的 forward 能真正从 `split_index > 0` 继续。
 - 补充单请求恢复时的日志和指标：
   记录是否走 request-owned resume、是否 fallback、fallback reason。
+- 增加队列与恢复深度观测：
+  `preempted_prefill_queue` 长度、resume depth（`split_index`）、
+  每请求 preemption 次数、preemption latency。
+- 输出足够结构化的信息，能够复盘：
+  arrival -> mark preempt pending -> preempted -> resumed -> finished/aborted。
 
 ### P1：清理单请求恢复的 guard 边界
 
-- 审计当前 guard 的每个限制项是否真的是硬限制，优先判断：
-  `return_logprob`、grammar、`input_embeds`、multimodal、encoder-decoder。
-- 对能安全放开的项逐步移除 guard，并补对应测试。
-- 如果某个限制短期内不准备支持，要在用户文档和日志里写清楚。
+- 近期只审计 `encoder-decoder` 是否真的是硬限制。
+- `input_embeds`、grammar、multimodal 暂时不做，转入未来兼容性规划。
+- 对短期内不准备支持的限制，在用户文档和日志里继续明确说明。
 
-### P2：开始做真正的多请求 request-level resume
+### P2：回补单请求 request-owned resume 的自动化验证
+
+- 增加一个更贴近真实实现的测试，验证单请求恢复路径不会回到
+  `prepare_for_extend()`，也不会重新分配 KV。
+- `Qwen3-30B-A3B` 已完成一轮单请求恢复真实性验证：
+  恢复后的 forward 能从 `split_index > 0` 继续。
+- 后续补齐自动化验证：
+  至少再覆盖一类 Llama 模型，并把“非零 `split_index` 恢复”收进集成测试。
+
+### P3：开始做真正的多请求 request-level resume
 
 - 去掉“多请求 parked batch 依赖 `resume_batch` 恢复”的兼容层。
 - 先支持最保守版本：
@@ -66,12 +80,21 @@ layer-level MVP 与论文
   支持相同 `split_index` 的多个 req regroup，继续禁止不同 `split_index`
   混批。
 
-### P3：为后续 slack-aware scheduling 预留接口
+### P4：为后续 slack-aware scheduling 预留接口
 
 - 在 `Req` 上补齐 arrival/deadline/slack/remaining-time 需要的字段。
 - 把 `_flowprefill_priority_key()` 重构成 policy dispatcher，
   为 `deadline_fcfs` 和 `slack_edf` 做接口预留。
 - 先加测试桩，不急着实现完整策略。
+
+### Future：兼容性扩展规划
+
+- 未来再评估单请求 request-owned resume 对 `input_embeds` 的支持，
+  重点检查恢复后输入 embedding 与 KV / cache index 的一致性。
+- 未来再评估 grammar-constrained request 的支持，
+  重点检查 grammar runtime state 是否能跨 split-prefill resume 保持一致。
+- 未来再评估 multimodal request 的支持，
+  重点检查 multimodal preprocessing / embedding state 是否能稳定复用。
 
 论文与设计笔记中最值得保留的原则：
 

@@ -115,6 +115,15 @@ With `--schedule-low-priority-values-first`, smaller priority integers are consi
 - It only introduces preemption checkpoints between split-prefill steps, not in the middle of a layer chunk.
 - It currently does not support a deadline-based ordering policy.
 - It depends on model support for `forward_split_prefill`, so availability varies by model implementation.
+- The current resume path is still transitional:
+  single-request parked prefills may resume from request-owned state, but
+  multi-request parked prefills still fall back to parked-batch resume.
+- The request-owned single-request resume path is currently limited to a safe subset.
+  Requests using grammar constraints, `input_embeds`, multimodal inputs, or
+  encoder-decoder models fall back to parked-batch resume instead of taking the
+  lightweight single-request resume path.
+- Near-term development is not targeting `input_embeds`, grammar-constrained, or
+  multimodal request-owned resume support yet; those remain future compatibility work.
 
 ## Troubleshooting
 
