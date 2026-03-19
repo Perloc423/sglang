@@ -238,6 +238,7 @@ class FlowPrefillExecCtx:
     split_forward_batch: Optional[ForwardBatch] = None
     seq_lens_cpu_cache: Optional[torch.Tensor] = None
     split_attn_backend_needs_reinit: bool = False
+    prefill_stats: Optional["PrefillStats"] = None
     resume_batch: Optional["ScheduleBatch"] = None
 
 
@@ -1183,6 +1184,7 @@ class Req(ReqDllmMixin):
         self.flowprefill_ctx.split_attn_backend_needs_reinit = (
             batch.split_attn_backend_needs_reinit
         )
+        self.flowprefill_ctx.prefill_stats = batch.prefill_stats
         self.flowprefill_ctx.resume_batch = batch
 
     def apply_flowprefill_ctx_to_batch(self, batch: "ScheduleBatch"):
@@ -1192,6 +1194,7 @@ class Req(ReqDllmMixin):
         batch.split_attn_backend_needs_reinit = (
             self.flowprefill_ctx.split_attn_backend_needs_reinit
         )
+        batch.prefill_stats = self.flowprefill_ctx.prefill_stats
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -1501,6 +1504,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=forward_batch.mamba_track_indices,
             mamba_track_mask=forward_batch.mamba_track_mask,
             mamba_track_seqlens=forward_batch.mamba_track_seqlens,
+            prefill_stats=req.flowprefill_ctx.prefill_stats,
         )
         batch.top_logprobs_nums = [req.top_logprobs_num] if req.return_logprob else None
         batch.token_ids_logprobs = (
