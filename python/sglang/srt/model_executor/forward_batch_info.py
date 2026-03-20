@@ -29,6 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -420,6 +421,139 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+
+    def slice_for_flowprefill_req(self, req_index: int) -> Optional["ForwardBatch"]:
+        """Create a single-request split-prefill snapshot from a batched forward state."""
+
+        if self.batch_size == 1:
+            return self
+        if self.model_specific_states is not None:
+            return None
+
+        token_start = (
+            int(self.extend_start_loc[req_index].item())
+            if self.extend_start_loc is not None
+            else sum(int(x) for x in self.extend_seq_lens_cpu[:req_index])
+        )
+        token_len = (
+            int(self.extend_seq_lens[req_index].item())
+            if self.extend_seq_lens is not None
+            else self.extend_seq_lens_cpu[req_index]
+        )
+        token_end = token_start + token_len
+
+        def slice_batch_tensor(
+            tensor: Optional[torch.Tensor],
+        ) -> Optional[torch.Tensor]:
+            return None if tensor is None else tensor[req_index : req_index + 1]
+
+        def slice_token_tensor(
+            tensor: Optional[torch.Tensor],
+        ) -> Optional[torch.Tensor]:
+            return None if tensor is None else tensor[token_start:token_end]
+
+        def slice_token_positions(
+            tensor: Optional[torch.Tensor],
+        ) -> Optional[torch.Tensor]:
+            if tensor is None:
+                return None
+            if tensor.dim() <= 1:
+                return tensor[token_start:token_end]
+            return tensor[:, token_start:token_end]
+
+        sliced = copy.copy(self)
+        sliced.batch_size = 1
+        sliced.input_ids = slice_token_tensor(self.input_ids)
+        sliced.req_pool_indices = slice_batch_tensor(self.req_pool_indices)
+        sliced.seq_lens = slice_batch_tensor(self.seq_lens)
+        sliced.out_cache_loc = slice_token_tensor(self.out_cache_loc)
+        sliced.seq_lens_sum = (
+            int(sliced.seq_lens[0].item()) if sliced.seq_lens is not None else 0
+        )
+        sliced.orig_seq_lens = slice_batch_tensor(self.orig_seq_lens)
+        sliced.out_cache_loc_swa = slice_token_tensor(self.out_cache_loc_swa)
+        sliced.mamba_track_indices = slice_batch_tensor(self.mamba_track_indices)
+        sliced.mamba_track_mask = slice_batch_tensor(self.mamba_track_mask)
+        sliced.mamba_track_seqlens = slice_batch_tensor(self.mamba_track_seqlens)
+        sliced.seq_lens_cpu = slice_batch_tensor(self.seq_lens_cpu)
+        sliced.top_logprobs_nums = (
+            None
+            if self.top_logprobs_nums is None
+            else [self.top_logprobs_nums[req_index]]
+        )
+        sliced.token_ids_logprobs = (
+            None
+            if self.token_ids_logprobs is None
+            else [self.token_ids_logprobs[req_index]]
+        )
+        sliced.temperature = slice_batch_tensor(self.temperature)
+        sliced.top_p = slice_batch_tensor(self.top_p)
+        sliced.positions = slice_token_positions(self.positions)
+        sliced.extend_num_tokens = token_len
+        sliced.extend_seq_lens = slice_batch_tensor(self.extend_seq_lens)
+        sliced.extend_prefix_lens = slice_batch_tensor(self.extend_prefix_lens)
+        sliced.extend_start_loc = (
+            None
+            if self.extend_start_loc is None
+            else self.extend_start_loc.new_zeros((1,))
+        )
+        sliced.extend_prefix_lens_cpu = (
+            None
+            if self.extend_prefix_lens_cpu is None
+            else [self.extend_prefix_lens_cpu[req_index]]
+        )
+        sliced.extend_seq_lens_cpu = (
+            None
+            if self.extend_seq_lens_cpu is None
+            else [self.extend_seq_lens_cpu[req_index]]
+        )
+        sliced.extend_logprob_start_lens_cpu = (
+            None
+            if self.extend_logprob_start_lens_cpu is None
+            else [self.extend_logprob_start_lens_cpu[req_index]]
+        )
+        sliced.extend_input_logprob_token_ids_gpu = slice_token_tensor(
+            self.extend_input_logprob_token_ids_gpu
+        )
+        sliced.hidden_states = slice_token_tensor(self.hidden_states)
+        sliced.residual = slice_token_tensor(self.residual)
+        sliced.mm_inputs = None if self.mm_inputs is None else [self.mm_inputs[req_index]]
+        sliced.encoder_cached = (
+            None if self.encoder_cached is None else [self.encoder_cached[req_index]]
+        )
+        sliced.encoder_lens = slice_batch_tensor(self.encoder_lens)
+        sliced.encoder_lens_cpu = (
+            None if self.encoder_lens_cpu is None else [self.encoder_lens_cpu[req_index]]
+        )
+        sliced.encoder_out_cache_loc = slice_token_tensor(self.encoder_out_cache_loc)
+        sliced.lora_ids = None if self.lora_ids is None else [self.lora_ids[req_index]]
+        sliced.input_embeds = slice_token_tensor(self.input_embeds)
+        sliced.token_type_ids = slice_token_tensor(self.token_type_ids)
+        sliced.mm_input_embeds = slice_token_tensor(self.mm_input_embeds)
+        sliced.ngram_embedding_info = (
+            None
+            if self.ngram_embedding_info is None
+            else NgramEmbeddingInfo(
+                token_table=self.ngram_embedding_info.token_table,
+                column_starts=self.ngram_embedding_info.column_starts[
+                    req_index : req_index + 1
+                ],
+                req_lens=self.ngram_embedding_info.req_lens[
+                    req_index : req_index + 1
+                ],
+                out_column_starts=self.ngram_embedding_info.out_column_starts[
+                    req_index : req_index + 1
+                ],
+                out_req_lens=self.ngram_embedding_info.out_req_lens[
+                    req_index : req_index + 1
+                ],
+            )
+        )
+        sliced.dimensions = (
+            None if self.dimensions is None else [self.dimensions[req_index]]
+        )
+        sliced.rids = None if self.rids is None else [self.rids[req_index]]
+        return sliced
 
     @classmethod
     def init_new(

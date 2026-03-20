@@ -1198,6 +1198,37 @@ class Req(ReqDllmMixin):
         )
         batch.prefill_stats = self.flowprefill_ctx.prefill_stats
 
+    def sync_flowprefill_ctx_from_multi_req_batch(
+        self, batch: "ScheduleBatch", req_index: int
+    ) -> bool:
+        if batch.split_forward_batch is None:
+            return False
+
+        single_req_forward_batch = batch.split_forward_batch.slice_for_flowprefill_req(
+            req_index
+        )
+        if single_req_forward_batch is None:
+            return False
+
+        self.prefill_resume_split_index = batch.split_index
+        self.flowprefill_ctx.split_index = batch.split_index
+        self.flowprefill_ctx.split_forward_batch = single_req_forward_batch
+
+        seq_lens_cpu_cache = batch.seq_lens_cpu_cache
+        if seq_lens_cpu_cache is None:
+            seq_lens_cpu_cache = batch.split_forward_batch.seq_lens_cpu
+        self.flowprefill_ctx.seq_lens_cpu_cache = (
+            None
+            if seq_lens_cpu_cache is None
+            else seq_lens_cpu_cache[req_index : req_index + 1]
+        )
+        self.flowprefill_ctx.split_attn_backend_needs_reinit = (
+            batch.split_attn_backend_needs_reinit
+        )
+        self.flowprefill_ctx.prefill_stats = batch.prefill_stats
+        self.flowprefill_ctx.resume_batch = None
+        return True
+
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
@@ -1452,6 +1483,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         assert req.flowprefill_ctx.split_forward_batch is not None
         forward_batch = req.flowprefill_ctx.split_forward_batch
+        assert forward_batch.batch_size == 1
         seq_lens_cpu_cache = req.flowprefill_ctx.seq_lens_cpu_cache
         if seq_lens_cpu_cache is None:
             seq_lens_cpu_cache = forward_batch.seq_lens_cpu
@@ -1548,6 +1580,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             model_config.vocab_size,
         )
         batch.prepare_for_split_prefill()
+        logger.info(
+            "FlowPrefill verification: request-owned resume batch built "
+            "(rid=%s, split_index=%d, prepare_for_extend_skipped=true, "
+            "req_pool_indices_reused=%s, out_cache_loc_reused=%s, seq_lens_cpu_cache_reused=%s)",
+            req.rid,
+            batch.split_index,
+            batch.req_pool_indices is not None,
+            batch.out_cache_loc is not None,
+            batch.seq_lens_cpu_cache is not None,
+        )
         req.sync_flowprefill_ctx_from_batch(batch)
         return batch
 
@@ -1641,6 +1683,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.is_dllm():
             # For DLLM, we use a separate forward mode
             self.forward_mode = ForwardMode.DLLM_EXTEND
+
+        resumed_flowprefill_reqs = [
+            req
+            for req in self.reqs
+            if getattr(req, "prefill_resume_split_index", 0) > 0
+        ]
+        if resumed_flowprefill_reqs:
+            logger.warning(
+                "FlowPrefill verification: resumed request unexpectedly entered prepare_for_extend "
+                "(rids=%s, split_indices=%s); req slot and KV allocation will be re-run",
+                [req.rid for req in resumed_flowprefill_reqs],
+                [req.prefill_resume_split_index for req in resumed_flowprefill_reqs],
+            )
 
         # Init tensors
         reqs = self.reqs

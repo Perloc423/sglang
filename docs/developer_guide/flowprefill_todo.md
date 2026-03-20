@@ -8,8 +8,8 @@ layer-level MVP 与论文
 当前仓库状态：
 
 - 已有 layer-level cooperative preemption 的实验版实现。
-- 当前实现更接近 batch-level split-prefill resume，而不是论文中的完整
-  request-level 调度模型。
+- 当前实现已从“batch-level split-prefill resume”进一步推进到
+  “request-owned resume 为主、同 `split_index` regroup 尚未实现”的过渡形态。
 - 当前仅实现 `priority_fcfs`，尚未实现 slack-aware 的 deadline 调度。
 - 还未实现 SLO-aware batching、长短 prefill 分流、operator-level
   preemption 和 TP-safe coordinated preemption。
@@ -26,8 +26,11 @@ layer-level MVP 与论文
   `Req.flowprefill_ctx` 重建单请求 `ScheduleBatch`。
 - 单请求 request-owned resume 已支持 `return_logprob`，
   不再因 logprob 路径退回 parked-batch resume。
-- 多请求 parked batch 目前仍通过 `resume_batch` 兼容恢复；
-  这是一层显式过渡，不是最终设计。
+- 多请求 parked batch 已支持最小 request-level resume：
+  抢占时会尽量为每个 req 切出 request-owned 的单 req `ForwardBatch`
+  快照，后续按单 req 恢复，不再强依赖 `resume_batch`。
+- 对于无法安全切出单 req 快照的场景，当前仍保留 `resume_batch`
+  fallback 作为兼容兜底；这是一层显式过渡，不是最终设计。
 - 单请求 request-owned resume 的 guard 和 fallback reason 已显式化，
   便于后续逐步放宽支持范围。
 - 已补一轮初始可观测性：
@@ -36,7 +39,8 @@ layer-level MVP 与论文
 
 当前还没有做到的关键点：
 
-- 多请求 preempted req 的真正 regroup 仍未实现。
+- 同 `split_index` 的多请求 regroup 仍未实现；
+  当前多请求 request-level resume 仍以单 req 恢复为主。
 - 单请求 request-owned resume 仍只对安全子集开放：
   非 grammar、非 multimodal、非 input_embeds、非
   encoder-decoder 等。
@@ -50,13 +54,13 @@ layer-level MVP 与论文
   `alloc_req_slots()` 阶段失败；当前验证和测试应至少使用
   `--max-running-requests 2`。
 - 还没有接入 slack-aware scheduling，也没有引入 remaining-time predictor。
-- 多请求 parked req 仍未进入真正的 request-level resume，
-  当前 `resume batch has multiple requests` 仍是主要 fallback 来源。
+- 目前已不再把“多请求 parked req 必须走 parked-batch fallback”作为主路径，
+  但还没有支持同 `split_index` 的 regroup 恢复。
 
 ## 下一步具体任务
 
 建议下一轮按下面顺序推进；当前可观测性和 `return_logprob`
-单请求恢复已落地，下一步优先收口测试、近期 guard 边界，以及最小化的
+单请求恢复已落地，下一步优先收口日志验收、近期 guard 边界，以及最小化的
 多请求 request-level resume：
 
 ### P0：先用实现期日志验收补护栏，再决定哪些约束进入自动化测试
@@ -88,23 +92,42 @@ layer-level MVP 与论文
 - `input_embeds`、grammar、multimodal 暂时不做，转入未来兼容性规划。
 - 对短期内不准备支持的限制，在用户文档和日志里继续明确说明。
 
-### P2：开始做真正的多请求 request-level resume 的最小版本
+### P2：多请求 request-level resume 的最小版本已落地
 
-- 去掉“多请求 parked batch 依赖 `resume_batch` 恢复”的兼容层。
-- 先支持最保守版本：
-  只允许相同 `split_index` 的 preempted req 单独恢复，不做 regroup。
+- 已支持最保守版本：
+  抢占时尽量把多请求 parked batch 切成 request-owned 的单 req 恢复态，
+  后续按单 req 恢复，不做 regroup。
+- 当前验收结果表明，在已覆盖 workload 下，多请求恢复已可走
+  `single_request` 路径，不再以
+  `resume batch has multiple requests` fallback 为主。
+- 仍保留 `resume_batch` fallback 兜底，用于无法安全切片的场景；
+  这层兼容在进入 regroup 之后再评估是否完全移除。
 
 ### P3：支持同 `split_index` 的 regroup
 
-- 在完成最小版本后，再支持相同 `split_index` 的多个 req regroup。
-- 继续禁止不同 `split_index` 混批，并把 no-mix 约束固化到测试。
+- 下一步重点转为支持相同 `split_index` 的多个 req regroup。
+- regroup 的目标是：
+  让已被切成 request-owned 单 req 恢复态的 parked req，
+  能在满足安全约束时重新组成同一 split-prefill batch 恢复。
+- 继续禁止不同 `split_index` 混批，并把 no-mix 约束固化到实现与后续回归手段。
+- regroup 完成后，再评估是否删除多请求 `resume_batch` fallback 兼容层。
 
 ### P4：为后续 slack-aware scheduling 预留接口
 
 - 在 `Req` 上补齐 arrival/deadline/slack/remaining-time 需要的字段。
 - 把 `_flowprefill_priority_key()` 重构成 policy dispatcher，
   为 `deadline_fcfs` 和 `slack_edf` 做接口预留。
-- 先加测试桩，不急着实现完整策略。
+- 先加接口桩，不急着实现完整策略。
+
+### Cleanup：删除本轮实现期验证日志
+
+- 当前阶段用于验收的临时日志包括：
+  request-owned resume batch built、
+  continuing split-prefill forward、
+  captured request-owned resume state、
+  以及 prepare_for_extend 异常告警。
+- 在 regroup 方案跑通并完成一轮验收后，删除这批一次性验证日志。
+- 删除时只保留长期有价值的 observability，不保留开发期调试噪声。
 
 ### Future：兼容性扩展规划
 

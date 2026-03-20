@@ -2049,11 +2049,26 @@ class Scheduler(
 
     def _enqueue_preempted_flowprefill_batch(self, batch: ScheduleBatch) -> None:
         now = time.perf_counter()
-        for req in batch.reqs:
-            req.sync_flowprefill_ctx_from_batch(batch)
+        for req_index, req in enumerate(batch.reqs):
+            captured_request_owned_state = False
             if len(batch.reqs) == 1:
+                req.sync_flowprefill_ctx_from_batch(batch)
                 req.flowprefill_ctx.resume_batch = None
+                captured_request_owned_state = True
+            else:
+                captured_request_owned_state = req.sync_flowprefill_ctx_from_multi_req_batch(
+                    batch, req_index
+                )
+                if not captured_request_owned_state:
+                    req.sync_flowprefill_ctx_from_batch(batch)
             req.flowprefill_ctx.preempted_at = now
+            if captured_request_owned_state:
+                logger.info(
+                    "FlowPrefill: captured request-owned resume state "
+                    "(rid=%s, split_index=%d, source=multi_request_batch)",
+                    req.rid,
+                    batch.split_index,
+                )
         self._clear_flowprefill_batch_runtime_state(batch)
         batch.batch_is_full = False
         for req in batch.reqs:
@@ -2975,6 +2990,13 @@ class Scheduler(
                     if self.spec_algorithm.is_none()
                     else {}
                 )
+                if batch.forward_mode.is_split_prefill() and batch.split_index > 0:
+                    logger.info(
+                        "FlowPrefill verification: continuing split-prefill forward "
+                        "(rids=%s, split_index=%d, resume_mode=resumed)",
+                        [req.rid for req in batch.reqs],
+                        batch.split_index,
+                    )
                 with self.record_forward_metrics(batch):
                     batch_result = self.model_worker.forward_batch_generation(
                         worker_batch_or_batch,
