@@ -832,6 +832,10 @@ class Req(ReqDllmMixin):
         self.prefill_deadline_ts: Optional[float] = None
         self.prefill_slack: Optional[float] = None
         self.prefill_predicted_remaining_time: Optional[float] = None
+        self.prefill_has_explicit_slack: bool = False
+        self.prefill_has_explicit_remaining_time: bool = False
+        self.prefill_observed_split_runtime: float = 0.0
+        self.prefill_observed_split_layers: int = 0
         self.prefill_preempt_pending: bool = False
         self.prefill_num_preemptions: int = 0
         self.prefill_resume_split_index: int = 0

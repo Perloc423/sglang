@@ -32,9 +32,15 @@ The current implementation uses the same priority direction as priority scheduli
 
 `priority_fcfs` is the current production policy. `deadline_fcfs` and `slack_edf`
 are already accepted by the CLI, and the request path can now carry deadline /
-slack metadata into the scheduler. They still do not have a remaining-time
-predictor behind them, so they remain experimental. Among requests with the same
-effective priority, older requests win.
+slack metadata into the scheduler. A lightweight remaining-time predictor is
+also wired in for requests that do not provide explicit
+`prefill_predicted_remaining_time`: the scheduler estimates remaining prefill
+time from observed split-prefill runtime per layer. Explicit request metadata
+still wins over the heuristic. You can also configure a server-wide default
+deadline source with `--flowprefill-default-ttft-slo-ms`, which is used only
+when a request does not explicitly provide `prefill_ttft_slo_ms` or
+`prefill_deadline_ts`. These policies remain experimental, and among requests
+with the same effective priority, older requests win.
 
 ## When to use it
 
@@ -72,7 +78,8 @@ If any of these constraints are violated, SGLang will keep serving normally and 
 | `--flowprefill-granularity` | Checkpoint granularity. Only `layer` is supported today. | `layer` |
 | `--flowprefill-split-layers` | Number of transformer layers executed per split-prefill step. Smaller values create more preemption points but add more scheduler handoffs. | `1` |
 | `--flowprefill-max-preemptions` | Maximum cooperative preemptions allowed per request. `0` means unlimited. | `0` |
-| `--flowprefill-priority-policy` | Ordering policy for FlowPrefill. `priority_fcfs` is the current production policy. `deadline_fcfs` and `slack_edf` are experimental and currently rely on request-supplied metadata plus simple fallback derivation. | `priority_fcfs` |
+| `--flowprefill-priority-policy` | Ordering policy for FlowPrefill. `priority_fcfs` is the current production policy. `deadline_fcfs` and `slack_edf` are experimental; they can use request-supplied metadata and a lightweight heuristic remaining-time predictor. | `priority_fcfs` |
+| `--flowprefill-default-ttft-slo-ms` | Default TTFT SLO in milliseconds used to derive FlowPrefill deadlines when requests do not explicitly provide `prefill_ttft_slo_ms` or `prefill_deadline_ts`. | `None` |
 
 ## Usage
 
@@ -114,15 +121,24 @@ With `--schedule-low-priority-values-first`, smaller priority integers are consi
 - Keep `--enable-priority-scheduling` aligned with your client-side priority semantics; FlowPrefill only helps when the scheduler can distinguish urgent requests.
 - For the current single-request preemption/resume path, start with
   `--max-running-requests 2` rather than `1`.
+- Be careful with `--flowprefill-default-ttft-slo-ms`: using one global default
+  for both long background requests and short urgent requests can make
+  `slack_edf` perform worse than `priority_fcfs`. Prefer explicit request
+  deadlines or at least different deadline classes for different workloads.
 
 ## Limitations
 
 - FlowPrefill is currently a **single-engine** optimization, not a replacement for PD disaggregation.
 - It only introduces preemption checkpoints between split-prefill steps, not in the middle of a layer chunk.
-- Deadline/slack-aware ordering is only partially wired today:
-  `deadline_fcfs` and `slack_edf` already accept request metadata through the
-  normal request path, but they are not yet backed by a remaining-time predictor
-  and therefore are still incomplete.
+- Deadline/slack-aware ordering is still experimental:
+  `deadline_fcfs` and `slack_edf` accept request metadata through the normal
+  request path, and missing `prefill_predicted_remaining_time` can now be
+  filled by a lightweight heuristic predictor based on observed split-prefill
+  runtime per layer. This is a minimal estimator, not yet a benchmarked or
+  calibrated production policy. In particular, a uniform server-level default
+  SLO can interact badly with mixed long/short workloads: long requests may
+  quickly become hopelessly negative-slack and distort scheduling away from the
+  intended urgent-first behavior.
 - It depends on model support for `forward_split_prefill`, so availability varies by model implementation.
 - The current resume path is still transitional:
   single-request parked prefills resume from request-owned state, and

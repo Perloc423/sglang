@@ -11,8 +11,8 @@ layer-level MVP 与论文
 - 当前实现已从“batch-level split-prefill resume”进一步推进到
   “request-owned resume + 同 `split_index` regroup 已落地”的过渡形态。
 - 当前已把 `_flowprefill_priority_key()` 重构为 policy dispatcher，
-  并为 `deadline_fcfs` / `slack_edf` 预留接口；完整 slack-aware deadline
-  调度仍未实现。
+  并已把 `deadline_fcfs` / `slack_edf` 接入最小的 heuristic predictor；
+  完整 slack-aware deadline 调度仍未实现。
 - 还未实现 SLO-aware batching、长短 prefill 分流、operator-level
   preemption 和 TP-safe coordinated preemption。
 
@@ -47,8 +47,14 @@ layer-level MVP 与论文
   observability / fallback 日志。
 - `Req` 上已补齐 `arrival/deadline/slack/predicted remaining time`
   的接口字段；CLI 已接受 `priority_fcfs` / `deadline_fcfs` /
-  `slack_edf`；请求侧 deadline/slack 字段赋值入口也已接通，但
-  predictor 仍未实现。
+  `slack_edf`；请求侧 deadline/slack 字段赋值入口也已接通。
+- 已接入一版 lightweight heuristic predictor：
+  对未显式提供 `prefill_predicted_remaining_time` 的请求，scheduler
+  会根据 split-prefill 的观测层耗时估计 remaining prefill time，并用于
+  `slack_edf` 的缺省 slack 计算。
+- 已补 server 级默认 SLO 参数：
+  当请求未显式提供 `prefill_ttft_slo_ms` / `prefill_deadline_ts` 时，
+  可由 `--flowprefill-default-ttft-slo-ms` 统一推导 deadline。
 
 当前还没有做到的关键点：
 
@@ -64,17 +70,25 @@ layer-level MVP 与论文
   抢占后若 urgent 请求仍需新分配 req slot，scheduler 会在
   `alloc_req_slots()` 阶段失败；当前验证和测试应至少使用
   `--max-running-requests 2`。
-- 还没有引入 remaining-time predictor，
-  deadline/slack 目前仍主要依赖显式传参或简单缺省推导。
+- 当前 remaining-time predictor 仍是最小 heuristic 版本，
+  deadline/slack 尚未经过 benchmark 校准，也还没有更强的 workload-aware
+  predictor。
+- 已确认 split-prefill runtime 观测链路现已生效，`predicted remaining`
+  与 `effective slack` 都能在调试日志中看到非空值；之前 runtime 全为 0
+  的问题来自只对 `EXTEND` 记录 prefill runtime，现已修复为对
+  `SPLIT_PREFILL` 也记录。
+- benchmark 结论表明，当前“裸 `slack_edf` + 统一默认 TTFT SLO”效果较差。
+  在背景长请求与短 urgent 请求共存的 workload 上，统一默认 deadline
+  会让长请求也快速进入大幅负 slack，导致调度目标偏离“优先保护 urgent”。
 - 当前 regroup 仍是最小版本：
   只对同 `split_index`、且满足 request-owned resume guard 的 parked req 生效，
   更复杂的 regroup / fallback 收缩仍待继续收口。
 
 ## 下一步具体任务
 
-建议下一轮按下面顺序推进；当前 regroup、日志 cleanup、以及 policy
-dispatcher 接口桩都已落地，下一步优先把 deadline/slack 输入来源和
-remaining-time predictor 接起来：
+建议下一轮按下面顺序推进；当前 regroup、日志 cleanup、deadline/slack
+请求通路、以及 heuristic predictor 都已落地，下一步优先做 benchmark
+和策略校准：
 
 ### Done：实现期日志验收与 cleanup 已完成
 
@@ -116,15 +130,38 @@ remaining-time predictor 接起来：
 - 已把这些字段接入 `GenerateReqInput -> TokenizedGenerateReqInput -> Req`
   的请求路径，并支持从 `prefill_ttft_slo_ms` 推导 deadline，
   以及在已有 deadline / remaining-time 时做最小 slack 推导。
+- 已支持 `--flowprefill-default-ttft-slo-ms`，作为请求未显式提供
+  `prefill_ttft_slo_ms` / `prefill_deadline_ts` 时的 server 级默认值。
 - 当前仍不应把 `deadline_fcfs` / `slack_edf` 视为完整可用策略；
-  在 predictor 接入前，它们仍主要依赖显式传参或简单缺省推导。
+  它们已经具备请求元数据通路，但还缺少 benchmark 驱动的调参与策略收口。
 
-### P5：引入 lightweight remaining-time predictor
+### Done：引入 lightweight remaining-time predictor
 
-- 为 `prefill_predicted_remaining_time` 提供最小可用来源，
-  先支持低成本 heuristic / lightweight predictor。
-- 在 predictor 接入后，再评估 `slack_edf` 的最小可用行为和 benchmark
-  方案。
+- 已为 `prefill_predicted_remaining_time` 提供最小可用来源：
+  对未显式传入 remaining time 的请求，优先使用 request-local 的
+  split-prefill 观测均值，没有 request-local 观测时再退到 scheduler
+  级的全局观测均值。
+- 当前 heuristic 基于“remaining layers * observed average layer latency”，
+  直接利用 `split_index` 和实际 split-prefill runtime。
+- 显式传入的 `prefill_predicted_remaining_time` 与 `prefill_slack`
+  仍然优先于 heuristic。
+- 已通过开发期调试日志验证：
+  修复 split-prefill runtime 采集后，新请求可从 scheduler 全局均值拿到
+  初始 `predicted_remaining_time`，已运行请求则会逐步切换到 request-local
+  观测均值。
+
+### P6：策略收口与 benchmark 校准
+
+- 在真实 workload 和 benchmark harness 上比较：
+  `priority_fcfs`、`deadline_fcfs`、`slack_edf`。
+- 重点观察 TTFT、goodput、deadline miss rate，以及 preempt/resume 次数。
+- 当前阶段不要再把“裸 `slack_edf` + 统一默认 TTFT SLO”当成目标策略。
+  benchmark 已显示该组合效果较差。
+- 优先改成更合理的策略输入和策略形态：
+  1. urgent/background 使用不同 deadline 语义，而不是统一默认 SLO
+  2. 支持“无 deadline 的 background 请求”或宽松 background deadline
+  3. 评估 `priority_then_slack_edf` 一类分层策略，而不是直接用纯 `slack_edf`
+  4. 再决定是否需要更强的 workload-aware predictor
 
 ### Future：兼容性扩展规划
 

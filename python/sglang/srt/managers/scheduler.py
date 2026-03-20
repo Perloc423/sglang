@@ -233,6 +233,10 @@ else:
 
 logger = logging.getLogger(__name__)
 
+FLOWPREFILL_HEURISTIC_DEBUG = get_bool_env_var(
+    "SGLANG_FLOWPREFILL_HEURISTIC_DEBUG"
+)
+
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
@@ -815,6 +819,8 @@ class Scheduler(
         self.waiting_queue: List[Req] = []
         self.preempted_prefill_queue: Deque[Req] = deque()
         self.running_split_prefill_batch: Optional[ScheduleBatch] = None
+        self.flowprefill_observed_split_runtime: float = 0.0
+        self.flowprefill_observed_split_layers: int = 0
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
@@ -1704,23 +1710,130 @@ class Scheduler(
         )
         req.prefill_deadline_ts = getattr(recv_req, "prefill_deadline_ts", None)
         req.prefill_slack = getattr(recv_req, "prefill_slack", None)
+        req.prefill_has_explicit_remaining_time = (
+            req.prefill_predicted_remaining_time is not None
+        )
+        req.prefill_has_explicit_slack = req.prefill_slack is not None
 
         prefill_ttft_slo_ms = getattr(recv_req, "prefill_ttft_slo_ms", None)
+        if prefill_ttft_slo_ms is None and req.prefill_deadline_ts is None:
+            prefill_ttft_slo_ms = getattr(
+                self.server_args, "flowprefill_default_ttft_slo_ms", None
+            )
         if req.prefill_deadline_ts is None and prefill_ttft_slo_ms is not None:
             req.prefill_deadline_ts = (
                 req.prefill_arrival_ts + float(prefill_ttft_slo_ms) / 1000.0
             )
 
-        if (
-            req.prefill_slack is None
-            and req.prefill_deadline_ts is not None
-            and req.prefill_predicted_remaining_time is not None
-        ):
-            req.prefill_slack = (
-                req.prefill_deadline_ts
-                - req.prefill_arrival_ts
-                - req.prefill_predicted_remaining_time
+        self._refresh_flowprefill_predicted_remaining_time(req)
+        self._refresh_flowprefill_slack(req, now=req.prefill_arrival_ts)
+
+    def _get_flowprefill_remaining_layers(
+        self, req: Req, split_index: Optional[int] = None
+    ) -> int:
+        if split_index is None:
+            split_index = req.flowprefill_ctx.split_index
+        return max(self.model_config.num_hidden_layers - int(split_index), 0)
+
+    def _get_flowprefill_average_layer_latency_seconds(
+        self, req: Req
+    ) -> Optional[float]:
+        if req.prefill_observed_split_layers > 0:
+            return (
+                req.prefill_observed_split_runtime / req.prefill_observed_split_layers
             )
+
+        scheduler_observed_layers = getattr(
+            self, "flowprefill_observed_split_layers", 0
+        )
+        if scheduler_observed_layers > 0:
+            return (
+                getattr(self, "flowprefill_observed_split_runtime", 0.0)
+                / scheduler_observed_layers
+            )
+        return None
+
+    def _estimate_flowprefill_remaining_time(
+        self, req: Req, split_index: Optional[int] = None
+    ) -> Optional[float]:
+        avg_layer_latency = self._get_flowprefill_average_layer_latency_seconds(req)
+        if avg_layer_latency is None:
+            return None
+        remaining_layers = self._get_flowprefill_remaining_layers(req, split_index)
+        return remaining_layers * avg_layer_latency
+
+    def _refresh_flowprefill_predicted_remaining_time(
+        self, req: Req, split_index: Optional[int] = None
+    ) -> None:
+        if req.prefill_has_explicit_remaining_time:
+            return
+        req.prefill_predicted_remaining_time = self._estimate_flowprefill_remaining_time(
+            req, split_index=split_index
+        )
+
+    def _get_flowprefill_effective_slack(
+        self, req: Req, now: Optional[float] = None
+    ) -> Optional[float]:
+        if req.prefill_has_explicit_slack:
+            return req.prefill_slack
+        if req.prefill_deadline_ts is None:
+            return None
+        predicted_remaining_time = req.prefill_predicted_remaining_time
+        if predicted_remaining_time is None:
+            predicted_remaining_time = self._estimate_flowprefill_remaining_time(req)
+            if predicted_remaining_time is None:
+                return None
+        if now is None:
+            now = time.perf_counter()
+        return req.prefill_deadline_ts - now - predicted_remaining_time
+
+    def _refresh_flowprefill_slack(
+        self, req: Req, now: Optional[float] = None
+    ) -> None:
+        if req.prefill_has_explicit_slack:
+            return
+        req.prefill_slack = self._get_flowprefill_effective_slack(req, now=now)
+
+    def _get_flowprefill_batch_runtime_seconds(
+        self, batch: ScheduleBatch
+    ) -> Optional[float]:
+        if not batch.reqs:
+            return None
+        time_stats = getattr(batch.reqs[0], "time_stats", None)
+        if time_stats is None:
+            return None
+        start_time = getattr(time_stats, "prefill_run_batch_start_time", 0.0)
+        end_time = getattr(time_stats, "prefill_run_batch_end_time", 0.0)
+        if start_time <= 0.0 or end_time < start_time:
+            return None
+        return end_time - start_time
+
+    def _observe_flowprefill_split_execution(
+        self, batch: ScheduleBatch, previous_split_index: int
+    ) -> None:
+        delta_layers = batch.split_index - previous_split_index
+        if delta_layers <= 0:
+            return
+
+        batch_runtime_seconds = self._get_flowprefill_batch_runtime_seconds(batch)
+        if batch_runtime_seconds is None:
+            return
+
+        self.flowprefill_observed_split_runtime = (
+            getattr(self, "flowprefill_observed_split_runtime", 0.0)
+            + batch_runtime_seconds
+        )
+        self.flowprefill_observed_split_layers = (
+            getattr(self, "flowprefill_observed_split_layers", 0) + delta_layers
+        )
+
+        for req in batch.reqs:
+            req.prefill_observed_split_runtime += batch_runtime_seconds
+            req.prefill_observed_split_layers += delta_layers
+            self._refresh_flowprefill_predicted_remaining_time(
+                req, split_index=batch.split_index
+            )
+            self._refresh_flowprefill_slack(req)
 
     def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
         for req in batch.reqs:
@@ -1976,19 +2089,33 @@ class Scheduler(
         return (deadline, req.time_stats.wait_queue_entry_time)
 
     def _flowprefill_priority_key_slack_edf(self, req: Req) -> Tuple[float, float, float]:
-        if req.prefill_slack is not None:
-            slack = req.prefill_slack
-        elif (
-            req.prefill_deadline_ts is not None
-            and req.prefill_predicted_remaining_time is not None
-        ):
-            slack = (
-                req.prefill_deadline_ts
-                - time.perf_counter()
-                - req.prefill_predicted_remaining_time
-            )
-        else:
+        slack = self._get_flowprefill_effective_slack(req, now=time.perf_counter())
+        if slack is None:
             slack = float("inf")
+        if FLOWPREFILL_HEURISTIC_DEBUG:
+            logger.info(
+                "FlowPrefill heuristic debug: "
+                "(rid=%s, split_index=%d, deadline=%s, explicit_slack=%s, "
+                "explicit_remaining=%s, predicted_remaining=%s, effective_slack=%s, "
+                "observed_runtime=%s, observed_layers=%s)",
+                req.rid,
+                req.flowprefill_ctx.split_index,
+                (
+                    f"{req.prefill_deadline_ts:.6f}"
+                    if req.prefill_deadline_ts is not None
+                    else "None"
+                ),
+                req.prefill_has_explicit_slack,
+                req.prefill_has_explicit_remaining_time,
+                (
+                    f"{req.prefill_predicted_remaining_time:.6f}"
+                    if req.prefill_predicted_remaining_time is not None
+                    else "None"
+                ),
+                f"{slack:.6f}" if slack != float("inf") else "inf",
+                f"{req.prefill_observed_split_runtime:.6f}",
+                req.prefill_observed_split_layers,
+            )
         deadline = (
             req.prefill_deadline_ts
             if req.prefill_deadline_ts is not None
@@ -3051,8 +3178,9 @@ class Scheduler(
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
 
-        # Capture prefill start time for EXTEND mode
-        if batch.forward_mode == ForwardMode.EXTEND:
+        # Capture prefill start time for all prefill-style forwards, including
+        # FlowPrefill split-prefill steps.
+        if batch.forward_mode.is_prefill():
             set_time_batch(batch.reqs, "set_prefill_run_batch_start_time")
 
         # Place holder handling for pd-disagg decode event loop
@@ -3192,8 +3320,9 @@ class Scheduler(
                 embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
                 ret = EmbeddingBatchResult(embeddings=embeddings)
 
-        # Capture prefill end time for EXTEND mode
-        if batch.forward_mode == ForwardMode.EXTEND:
+        # Capture prefill end time for all prefill-style forwards, including
+        # FlowPrefill split-prefill steps.
+        if batch.forward_mode.is_prefill():
             set_time_batch(batch.reqs, "set_prefill_run_batch_end_time")
 
         if (
@@ -3231,8 +3360,11 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ) -> None:
+        previous_split_index = batch.split_index
         if batch.split_forward_batch is not None:
             batch.split_index = batch.split_forward_batch.split_index
+
+        self._observe_flowprefill_split_execution(batch, previous_split_index)
 
         is_finished = batch.split_index >= self.model_config.num_hidden_layers
         if is_finished:
@@ -3261,6 +3393,10 @@ class Scheduler(
 
         for req in batch.reqs:
             req.prefill_resume_split_index = batch.split_index
+            self._refresh_flowprefill_predicted_remaining_time(
+                req, split_index=batch.split_index
+            )
+            self._refresh_flowprefill_slack(req)
             req.sync_flowprefill_ctx_from_batch(batch)
 
         if any(req.prefill_preempt_pending for req in batch.reqs):
