@@ -556,6 +556,180 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         return sliced
 
     @classmethod
+    def concat_for_flowprefill(
+        cls, forward_batches: List["ForwardBatch"]
+    ) -> "ForwardBatch":
+        """Concatenate single-request split-prefill snapshots into one batch."""
+
+        assert forward_batches
+        if len(forward_batches) == 1:
+            return forward_batches[0]
+        assert all(batch.batch_size == 1 for batch in forward_batches)
+        assert all(
+            batch.split_index == forward_batches[0].split_index
+            for batch in forward_batches
+        )
+
+        base = copy.copy(forward_batches[0])
+
+        def cat_optional_batch_tensor(name: str) -> Optional[torch.Tensor]:
+            values = [getattr(batch, name) for batch in forward_batches]
+            if all(value is None for value in values):
+                return None
+            assert all(value is not None for value in values)
+            return torch.cat(values, dim=0)
+
+        def cat_optional_token_tensor(name: str) -> Optional[torch.Tensor]:
+            values = [getattr(batch, name) for batch in forward_batches]
+            if all(value is None for value in values):
+                return None
+            assert all(value is not None for value in values)
+            return torch.cat(values, dim=0)
+
+        def cat_optional_position_tensor(name: str) -> Optional[torch.Tensor]:
+            values = [getattr(batch, name) for batch in forward_batches]
+            if all(value is None for value in values):
+                return None
+            assert all(value is not None for value in values)
+            dim = 0 if values[0].dim() <= 1 else 1
+            return torch.cat(values, dim=dim)
+
+        base.batch_size = len(forward_batches)
+        base.input_ids = cat_optional_token_tensor("input_ids")
+        base.req_pool_indices = cat_optional_batch_tensor("req_pool_indices")
+        base.seq_lens = cat_optional_batch_tensor("seq_lens")
+        base.out_cache_loc = cat_optional_token_tensor("out_cache_loc")
+        base.seq_lens_sum = sum(batch.seq_lens_sum for batch in forward_batches)
+        base.orig_seq_lens = cat_optional_batch_tensor("orig_seq_lens")
+        base.out_cache_loc_swa = cat_optional_token_tensor("out_cache_loc_swa")
+        base.mamba_track_indices = cat_optional_batch_tensor("mamba_track_indices")
+        base.mamba_track_mask = cat_optional_batch_tensor("mamba_track_mask")
+        base.mamba_track_seqlens = cat_optional_batch_tensor("mamba_track_seqlens")
+        base.seq_lens_cpu = cat_optional_batch_tensor("seq_lens_cpu")
+        base.top_logprobs_nums = (
+            None
+            if any(batch.top_logprobs_nums is None for batch in forward_batches)
+            else sum((batch.top_logprobs_nums for batch in forward_batches), [])
+        )
+        base.token_ids_logprobs = (
+            None
+            if any(batch.token_ids_logprobs is None for batch in forward_batches)
+            else sum((batch.token_ids_logprobs for batch in forward_batches), [])
+        )
+        base.temperature = cat_optional_batch_tensor("temperature")
+        base.top_p = cat_optional_batch_tensor("top_p")
+        base.positions = cat_optional_position_tensor("positions")
+        base.extend_num_tokens = sum(
+            batch.extend_num_tokens or 0 for batch in forward_batches
+        )
+        base.extend_seq_lens = cat_optional_batch_tensor("extend_seq_lens")
+        base.extend_prefix_lens = cat_optional_batch_tensor("extend_prefix_lens")
+        if base.extend_seq_lens is not None:
+            starts = [0]
+            for batch in forward_batches[:-1]:
+                starts.append(starts[-1] + int(batch.extend_num_tokens or 0))
+            base.extend_start_loc = forward_batches[0].extend_start_loc.new_tensor(starts)
+        else:
+            base.extend_start_loc = None
+        base.extend_prefix_lens_cpu = (
+            None
+            if any(batch.extend_prefix_lens_cpu is None for batch in forward_batches)
+            else sum((batch.extend_prefix_lens_cpu for batch in forward_batches), [])
+        )
+        base.extend_seq_lens_cpu = (
+            None
+            if any(batch.extend_seq_lens_cpu is None for batch in forward_batches)
+            else sum((batch.extend_seq_lens_cpu for batch in forward_batches), [])
+        )
+        base.extend_logprob_start_lens_cpu = (
+            None
+            if any(
+                batch.extend_logprob_start_lens_cpu is None
+                for batch in forward_batches
+            )
+            else sum(
+                (batch.extend_logprob_start_lens_cpu for batch in forward_batches), []
+            )
+        )
+        base.extend_input_logprob_token_ids_gpu = cat_optional_token_tensor(
+            "extend_input_logprob_token_ids_gpu"
+        )
+        base.hidden_states = cat_optional_token_tensor("hidden_states")
+        base.residual = cat_optional_token_tensor("residual")
+        base.mm_inputs = (
+            None
+            if any(batch.mm_inputs is None for batch in forward_batches)
+            else sum((batch.mm_inputs for batch in forward_batches), [])
+        )
+        base.encoder_cached = (
+            None
+            if any(batch.encoder_cached is None for batch in forward_batches)
+            else sum((batch.encoder_cached for batch in forward_batches), [])
+        )
+        base.encoder_lens = cat_optional_batch_tensor("encoder_lens")
+        base.encoder_lens_cpu = (
+            None
+            if any(batch.encoder_lens_cpu is None for batch in forward_batches)
+            else sum((batch.encoder_lens_cpu for batch in forward_batches), [])
+        )
+        base.encoder_out_cache_loc = cat_optional_token_tensor("encoder_out_cache_loc")
+        base.lora_ids = (
+            None
+            if any(batch.lora_ids is None for batch in forward_batches)
+            else sum((batch.lora_ids for batch in forward_batches), [])
+        )
+        base.input_embeds = cat_optional_token_tensor("input_embeds")
+        base.token_type_ids = cat_optional_token_tensor("token_type_ids")
+        base.mm_input_embeds = cat_optional_token_tensor("mm_input_embeds")
+        if any(batch.ngram_embedding_info is None for batch in forward_batches):
+            base.ngram_embedding_info = None
+        else:
+            token_table = forward_batches[0].ngram_embedding_info.token_table
+            assert all(
+                batch.ngram_embedding_info.token_table is token_table
+                for batch in forward_batches
+            )
+            base.ngram_embedding_info = NgramEmbeddingInfo(
+                token_table=token_table,
+                column_starts=torch.cat(
+                    [
+                        batch.ngram_embedding_info.column_starts
+                        for batch in forward_batches
+                    ],
+                    dim=0,
+                ),
+                req_lens=torch.cat(
+                    [batch.ngram_embedding_info.req_lens for batch in forward_batches],
+                    dim=0,
+                ),
+                out_column_starts=torch.cat(
+                    [
+                        batch.ngram_embedding_info.out_column_starts
+                        for batch in forward_batches
+                    ],
+                    dim=0,
+                ),
+                out_req_lens=torch.cat(
+                    [
+                        batch.ngram_embedding_info.out_req_lens
+                        for batch in forward_batches
+                    ],
+                    dim=0,
+                ),
+            )
+        base.dimensions = (
+            None
+            if any(batch.dimensions is None for batch in forward_batches)
+            else sum((batch.dimensions for batch in forward_batches), [])
+        )
+        base.rids = (
+            None
+            if any(batch.rids is None for batch in forward_batches)
+            else sum((batch.rids for batch in forward_batches), [])
+        )
+        return base
+
+    @classmethod
     def init_new(
         cls,
         batch: ModelWorkerBatch,

@@ -3829,7 +3829,7 @@ class ServerArgs:
             "--flowprefill-priority-policy",
             type=str,
             default=ServerArgs.flowprefill_priority_policy,
-            choices=["priority_fcfs"],
+            choices=["priority_fcfs", "deadline_fcfs", "slack_edf"],
             help="Priority policy used to pick the next FlowPrefill batch.",
         )
         parser.add_argument(
@@ -5964,8 +5964,12 @@ class ServerArgs:
             assert self.flowprefill_max_preemptions >= 0, (
                 "--flowprefill-max-preemptions must be non-negative."
             )
-            assert self.flowprefill_priority_policy == "priority_fcfs", (
-                "Only priority_fcfs FlowPrefill scheduling is supported right now."
+            assert self.flowprefill_priority_policy in {
+                "priority_fcfs",
+                "deadline_fcfs",
+                "slack_edf",
+            }, (
+                "Unsupported FlowPrefill scheduling policy."
             )
 
         # Check multi-item scoring

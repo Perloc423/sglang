@@ -20,7 +20,10 @@ def make_req(rid: str, priority: int, wait_time: float, split_index: int = 0):
     req = SimpleNamespace()
     req.rid = rid
     req.priority = priority
+    req.prefill_arrival_ts = wait_time
     req.prefill_deadline_ts = None
+    req.prefill_slack = None
+    req.prefill_predicted_remaining_time = None
     req.prefill_preempt_pending = False
     req.prefill_num_preemptions = 0
     req.prefill_resume_split_index = split_index
@@ -150,6 +153,64 @@ class TestFlowPrefillScheduler(CustomTestCase):
         self.assertTrue(running_req.prefill_preempt_pending)
         self.assertEqual(running_req.prefill_state, PrefillState.PREEMPT_PENDING)
 
+    def test_deadline_fcfs_prefers_earlier_deadline(self):
+        self.scheduler.server_args.flowprefill_priority_policy = "deadline_fcfs"
+        req0 = make_req("r0", priority=1, wait_time=10.0)
+        req1 = make_req("r1", priority=10, wait_time=5.0)
+        req0.prefill_deadline_ts = 200.0
+        req1.prefill_deadline_ts = 100.0
+
+        self.assertLess(
+            self.scheduler._flowprefill_priority_key(req1),
+            self.scheduler._flowprefill_priority_key(req0),
+        )
+
+    def test_initialize_flowprefill_deadline_from_ttft_slo(self):
+        req = make_req("r0", priority=1, wait_time=10.0)
+        req.arrival_time = 10.0
+        recv_req = SimpleNamespace(
+            prefill_ttft_slo_ms=250.0,
+            prefill_deadline_ts=None,
+            prefill_slack=None,
+            prefill_predicted_remaining_time=None,
+        )
+
+        self.scheduler._initialize_flowprefill_scheduling_fields(req, recv_req)
+
+        self.assertEqual(req.prefill_arrival_ts, 10.0)
+        self.assertEqual(req.prefill_deadline_ts, 10.25)
+        self.assertIsNone(req.prefill_slack)
+
+    def test_initialize_flowprefill_preserves_explicit_slack_and_remaining_time(self):
+        req = make_req("r0", priority=1, wait_time=10.0)
+        req.arrival_time = 10.0
+        recv_req = SimpleNamespace(
+            prefill_ttft_slo_ms=None,
+            prefill_deadline_ts=12.0,
+            prefill_slack=1.5,
+            prefill_predicted_remaining_time=0.75,
+        )
+
+        self.scheduler._initialize_flowprefill_scheduling_fields(req, recv_req)
+
+        self.assertEqual(req.prefill_deadline_ts, 12.0)
+        self.assertEqual(req.prefill_slack, 1.5)
+        self.assertEqual(req.prefill_predicted_remaining_time, 0.75)
+
+    def test_slack_edf_prefers_smaller_slack(self):
+        self.scheduler.server_args.flowprefill_priority_policy = "slack_edf"
+        req0 = make_req("r0", priority=1, wait_time=10.0)
+        req1 = make_req("r1", priority=10, wait_time=5.0)
+        req0.prefill_slack = 10.0
+        req1.prefill_slack = 1.0
+        req0.prefill_deadline_ts = 200.0
+        req1.prefill_deadline_ts = 300.0
+
+        self.assertLess(
+            self.scheduler._flowprefill_priority_key(req1),
+            self.scheduler._flowprefill_priority_key(req0),
+        )
+
     def test_preempted_batch_is_selected_before_lower_priority_waiting(self):
         waiting_req = make_req("waiting", priority=1, wait_time=1.0)
         preempted_req = make_req("preempted", priority=5, wait_time=2.0, split_index=2)
@@ -209,6 +270,30 @@ class TestFlowPrefillScheduler(CustomTestCase):
         self.assertIs(req0.flowprefill_ctx.resume_batch, batch)
         self.assertIs(req1.flowprefill_ctx.resume_batch, batch)
 
+    def test_multi_req_preempted_batch_prefers_request_owned_state_when_sliceable(self):
+        req0 = make_req("r0", priority=5, wait_time=1.0, split_index=1)
+        req1 = make_req("r1", priority=4, wait_time=1.5, split_index=1)
+        req0.prefill_preempt_pending = True
+        req1.prefill_preempt_pending = True
+        batch = make_batch([req0, req1], split_index=2)
+        batch.split_forward_batch = MagicMock()
+        batch.split_forward_batch.slice_for_flowprefill_req.side_effect = [
+            SimpleNamespace(batch_size=1),
+            SimpleNamespace(batch_size=1),
+        ]
+        batch.seq_lens_cpu_cache = ["seq0", "seq1"]
+        self.scheduler.running_split_prefill_batch = batch
+
+        self.scheduler.process_batch_result_split_prefill(batch, MagicMock())
+
+        self.assertEqual(len(self.scheduler.preempted_prefill_queue), 2)
+        self.assertIsNone(req0.flowprefill_ctx.resume_batch)
+        self.assertIsNone(req1.flowprefill_ctx.resume_batch)
+        self.assertIsNotNone(req0.flowprefill_ctx.split_forward_batch)
+        self.assertIsNotNone(req1.flowprefill_ctx.split_forward_batch)
+        self.assertEqual(req0.flowprefill_ctx.seq_lens_cpu_cache, ["seq0"])
+        self.assertEqual(req1.flowprefill_ctx.seq_lens_cpu_cache, ["seq1"])
+
     def test_sibling_preempted_requests_resume_together(self):
         req0 = make_req("r0", priority=5, wait_time=1.0, split_index=2)
         req1 = make_req("r1", priority=4, wait_time=2.0, split_index=2)
@@ -227,6 +312,75 @@ class TestFlowPrefillScheduler(CustomTestCase):
         self.assertEqual(len(self.scheduler.preempted_prefill_queue), 0)
         self.assertEqual(req0.prefill_state, PrefillState.RUNNING)
         self.assertEqual(req1.prefill_state, PrefillState.RUNNING)
+
+    def test_sliceable_multi_req_parked_reqs_regroup_without_fallback(self):
+        req0 = make_req("r0", priority=5, wait_time=1.0, split_index=2)
+        req1 = make_req("r1", priority=4, wait_time=2.0, split_index=2)
+        req0.prefill_state = PrefillState.PREEMPTED
+        req1.prefill_state = PrefillState.PREEMPTED
+        req0.flowprefill_ctx.split_forward_batch = SimpleNamespace(batch_size=1)
+        req1.flowprefill_ctx.split_forward_batch = SimpleNamespace(batch_size=1)
+        req0.flowprefill_ctx.resume_batch = None
+        req1.flowprefill_ctx.resume_batch = None
+        req0.flowprefill_ctx.preempted_at = 10.0
+        req1.flowprefill_ctx.preempted_at = 11.0
+        regrouped_batch = make_batch([req1, req0], split_index=2)
+
+        self.scheduler.preempted_prefill_queue.append(req0)
+        self.scheduler.preempted_prefill_queue.append(req1)
+        self.scheduler.current_scheduler_metrics_enabled = True
+
+        with patch.object(
+            self.scheduler,
+            "_build_flowprefill_regrouped_batch",
+            return_value=regrouped_batch,
+        ) as build_regrouped, patch(
+            "sglang.srt.managers.scheduler.time.perf_counter", return_value=15.0
+        ):
+            selected = self.scheduler._get_next_flowprefill_candidate()
+
+        self.assertIs(selected, regrouped_batch)
+        self.assertEqual(len(self.scheduler.preempted_prefill_queue), 0)
+        self.assertEqual(req0.prefill_state, PrefillState.RUNNING)
+        self.assertEqual(req1.prefill_state, PrefillState.RUNNING)
+        build_regrouped.assert_called_once_with([req1, req0])
+        self.scheduler.metrics_collector.increment_flowprefill_resumed_requests.assert_called_once_with(
+            2, "request_regroup"
+        )
+        self.scheduler.metrics_collector.increment_flowprefill_resume_fallback.assert_not_called()
+        self.scheduler.metrics_collector.observe_flowprefill_resume.assert_called_once_with(
+            resume_mode="request_regroup",
+            split_index=2,
+            parked_duration_seconds=5.0,
+        )
+
+    def test_regroup_does_not_mix_different_split_indices(self):
+        req0 = make_req("r0", priority=5, wait_time=1.0, split_index=2)
+        req1 = make_req("r1", priority=4, wait_time=2.0, split_index=3)
+        req0.prefill_state = PrefillState.PREEMPTED
+        req1.prefill_state = PrefillState.PREEMPTED
+        req0.flowprefill_ctx.split_forward_batch = SimpleNamespace(batch_size=1)
+        req1.flowprefill_ctx.split_forward_batch = SimpleNamespace(batch_size=1)
+        req0.flowprefill_ctx.resume_batch = None
+        req1.flowprefill_ctx.resume_batch = None
+        resumed_batch = make_batch([req0], split_index=2)
+
+        self.scheduler.preempted_prefill_queue.append(req0)
+        self.scheduler.preempted_prefill_queue.append(req1)
+        self.scheduler.current_scheduler_metrics_enabled = True
+
+        with patch.object(
+            self.scheduler,
+            "_build_flowprefill_regrouped_batch",
+            return_value=resumed_batch,
+        ) as build_regrouped:
+            selected = self.scheduler._get_next_flowprefill_candidate()
+
+        self.assertIs(selected, resumed_batch)
+        self.assertEqual(len(self.scheduler.preempted_prefill_queue), 1)
+        self.assertIs(self.scheduler.preempted_prefill_queue[0], req1)
+        build_regrouped.assert_called_once_with([req0])
+        self.scheduler.metrics_collector.increment_flowprefill_resume_fallback.assert_not_called()
 
     def test_single_preempted_request_uses_request_owned_resume_path(self):
         req = make_req("r0", priority=5, wait_time=1.0, split_index=2)

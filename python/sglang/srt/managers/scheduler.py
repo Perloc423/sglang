@@ -177,7 +177,11 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.req_time_stats import (
     real_time,
@@ -1693,6 +1697,31 @@ class Scheduler(
             mm.mrope_positions = mrope_positions
             mm.mrope_position_delta = mrope_position_delta
 
+    def _initialize_flowprefill_scheduling_fields(self, req: Req, recv_req) -> None:
+        req.prefill_arrival_ts = req.arrival_time
+        req.prefill_predicted_remaining_time = getattr(
+            recv_req, "prefill_predicted_remaining_time", None
+        )
+        req.prefill_deadline_ts = getattr(recv_req, "prefill_deadline_ts", None)
+        req.prefill_slack = getattr(recv_req, "prefill_slack", None)
+
+        prefill_ttft_slo_ms = getattr(recv_req, "prefill_ttft_slo_ms", None)
+        if req.prefill_deadline_ts is None and prefill_ttft_slo_ms is not None:
+            req.prefill_deadline_ts = (
+                req.prefill_arrival_ts + float(prefill_ttft_slo_ms) / 1000.0
+            )
+
+        if (
+            req.prefill_slack is None
+            and req.prefill_deadline_ts is not None
+            and req.prefill_predicted_remaining_time is not None
+        ):
+            req.prefill_slack = (
+                req.prefill_deadline_ts
+                - req.prefill_arrival_ts
+                - req.prefill_predicted_remaining_time
+            )
+
     def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
         for req in batch.reqs:
             if not req.finished() or not (mm_inputs := req.multimodal_inputs):
@@ -1759,6 +1788,7 @@ class Scheduler(
                 time_stats=recv_req.time_stats,
             )
             req.tokenizer = self.tokenizer
+            self._initialize_flowprefill_scheduling_fields(req, recv_req)
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -1918,7 +1948,7 @@ class Scheduler(
                     prefix_keys,
                 )
 
-    def _flowprefill_priority_key(self, req: Req) -> Tuple[int, float]:
+    def _flowprefill_priority_key_priority_fcfs(self, req: Req) -> Tuple[float, float]:
         priority = (
             req.priority
             if req.priority is not None
@@ -1936,6 +1966,45 @@ class Scheduler(
             priority * priority_sign,
             time_key,
         )
+
+    def _flowprefill_priority_key_deadline_fcfs(self, req: Req) -> Tuple[float, float]:
+        deadline = (
+            req.prefill_deadline_ts
+            if req.prefill_deadline_ts is not None
+            else float("inf")
+        )
+        return (deadline, req.time_stats.wait_queue_entry_time)
+
+    def _flowprefill_priority_key_slack_edf(self, req: Req) -> Tuple[float, float, float]:
+        if req.prefill_slack is not None:
+            slack = req.prefill_slack
+        elif (
+            req.prefill_deadline_ts is not None
+            and req.prefill_predicted_remaining_time is not None
+        ):
+            slack = (
+                req.prefill_deadline_ts
+                - time.perf_counter()
+                - req.prefill_predicted_remaining_time
+            )
+        else:
+            slack = float("inf")
+        deadline = (
+            req.prefill_deadline_ts
+            if req.prefill_deadline_ts is not None
+            else float("inf")
+        )
+        return (slack, deadline, req.time_stats.wait_queue_entry_time)
+
+    def _flowprefill_priority_key(self, req: Req) -> Tuple[float, ...]:
+        policy = self.server_args.flowprefill_priority_policy
+        if policy == "priority_fcfs":
+            return self._flowprefill_priority_key_priority_fcfs(req)
+        if policy == "deadline_fcfs":
+            return self._flowprefill_priority_key_deadline_fcfs(req)
+        if policy == "slack_edf":
+            return self._flowprefill_priority_key_slack_edf(req)
+        raise ValueError(f"Unsupported FlowPrefill priority policy: {policy}")
 
     def _flowprefill_batch_priority_key(
         self, batch: ScheduleBatch
@@ -2062,13 +2131,6 @@ class Scheduler(
                 if not captured_request_owned_state:
                     req.sync_flowprefill_ctx_from_batch(batch)
             req.flowprefill_ctx.preempted_at = now
-            if captured_request_owned_state:
-                logger.info(
-                    "FlowPrefill: captured request-owned resume state "
-                    "(rid=%s, split_index=%d, source=multi_request_batch)",
-                    req.rid,
-                    batch.split_index,
-                )
         self._clear_flowprefill_batch_runtime_state(batch)
         batch.batch_is_full = False
         for req in batch.reqs:
@@ -2126,6 +2188,73 @@ class Scheduler(
     def _can_resume_flowprefill_req_as_single_batch(self, req: Req) -> bool:
         return self._get_flowprefill_single_req_resume_guard_failure(req) is None
 
+    def _get_flowprefill_regroupable_reqs(self, seed_req: Req) -> List[Req]:
+        if not self._can_resume_flowprefill_req_as_single_batch(seed_req):
+            return [seed_req]
+
+        split_index = seed_req.flowprefill_ctx.split_index
+        regroupable = [
+            req
+            for req in self.preempted_prefill_queue
+            if req.flowprefill_ctx.split_index == split_index
+            and self._can_resume_flowprefill_req_as_single_batch(req)
+        ]
+        regroupable.sort(key=self._flowprefill_preempted_req_priority_key)
+        return regroupable
+
+    def _build_flowprefill_regrouped_batch(
+        self, reqs: List[Req]
+    ) -> Optional[ScheduleBatch]:
+        if not reqs:
+            return None
+        if len(reqs) == 1:
+            return ScheduleBatch.init_single_req_from_flowprefill_ctx(
+                reqs[0],
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator,
+                self.tree_cache,
+                self.model_config,
+                self.enable_overlap,
+                self.spec_algorithm,
+            )
+
+        resumed_batches = [
+            ScheduleBatch.init_single_req_from_flowprefill_ctx(
+                req,
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator,
+                self.tree_cache,
+                self.model_config,
+                self.enable_overlap,
+                self.spec_algorithm,
+            )
+            for req in reqs
+        ]
+        regrouped_batch = resumed_batches[0]
+        for resumed_batch in resumed_batches[1:]:
+            regrouped_batch.merge_batch(resumed_batch)
+        regrouped_batch.split_forward_batch = ForwardBatch.concat_for_flowprefill(
+            [batch.split_forward_batch for batch in resumed_batches]
+        )
+        regrouped_batch.seq_lens_cpu_cache = torch.cat(
+            [batch.seq_lens_cpu_cache for batch in resumed_batches]
+        )
+        regrouped_batch.split_attn_backend_needs_reinit = any(
+            batch.split_attn_backend_needs_reinit for batch in resumed_batches
+        )
+        regrouped_batch.split_index = reqs[0].flowprefill_ctx.split_index
+        regrouped_batch.split_forward_count = self.server_args.flowprefill_split_layers
+        regrouped_batch.prefill_stats = reqs[0].flowprefill_ctx.prefill_stats
+        regrouped_batch.prepare_for_split_prefill()
+        logger.info(
+            "FlowPrefill: regrouped parked requests into split-prefill batch "
+            "(rids=%s, split_index=%d, batch_size=%d)",
+            [req.rid for req in reqs],
+            regrouped_batch.split_index,
+            len(reqs),
+        )
+        return regrouped_batch
+
     def _pop_next_flowprefill_batch(self) -> Optional[ScheduleBatch]:
         if not self.preempted_prefill_queue:
             return None
@@ -2138,35 +2267,48 @@ class Scheduler(
             self._get_flowprefill_single_req_resume_guard_failure(best_req)
         )
         if single_req_resume_failure is None:
-            self.preempted_prefill_queue.remove(best_req)
-            best_req.prefill_state = PrefillState.RUNNING
-            best_req.prefill_resume_split_index = best_req.flowprefill_ctx.split_index
-            best_batch = ScheduleBatch.init_single_req_from_flowprefill_ctx(
-                best_req,
-                self.req_to_token_pool,
-                self.token_to_kv_pool_allocator,
-                self.tree_cache,
-                self.model_config,
-                self.enable_overlap,
-                self.spec_algorithm,
+            regrouped_reqs = self._get_flowprefill_regroupable_reqs(best_req)
+            for req in regrouped_reqs:
+                self.preempted_prefill_queue.remove(req)
+                req.prefill_state = PrefillState.RUNNING
+                req.prefill_resume_split_index = req.flowprefill_ctx.split_index
+            best_batch = self._build_flowprefill_regrouped_batch(regrouped_reqs)
+            if best_batch is None:
+                return None
+            resume_mode = (
+                "request_regroup" if len(regrouped_reqs) > 1 else "single_request"
             )
             parked_duration_seconds = self._record_flowprefill_resume(
-                [best_req],
-                resume_mode="single_request",
+                regrouped_reqs,
+                resume_mode=resume_mode,
                 split_index=best_batch.split_index,
             )
-            logger.info(
-                "FlowPrefill: resuming single parked request "
-                "(rid=%s, split_index=%d, queue_remaining=%d, parked_ms=%s, resume_mode=single_request)",
-                best_req.rid,
-                best_batch.split_index,
-                len(self.preempted_prefill_queue),
-                (
-                    f"{parked_duration_seconds * 1000.0:.3f}"
-                    if parked_duration_seconds is not None
-                    else "unknown"
-                ),
-            )
+            if len(regrouped_reqs) > 1:
+                logger.info(
+                    "FlowPrefill: resuming regrouped parked requests "
+                    "(rids=%s, split_index=%d, queue_remaining=%d, parked_ms=%s, resume_mode=request_regroup)",
+                    [req.rid for req in regrouped_reqs],
+                    best_batch.split_index,
+                    len(self.preempted_prefill_queue),
+                    (
+                        f"{parked_duration_seconds * 1000.0:.3f}"
+                        if parked_duration_seconds is not None
+                        else "unknown"
+                    ),
+                )
+            else:
+                logger.info(
+                    "FlowPrefill: resuming single parked request "
+                    "(rid=%s, split_index=%d, queue_remaining=%d, parked_ms=%s, resume_mode=single_request)",
+                    best_req.rid,
+                    best_batch.split_index,
+                    len(self.preempted_prefill_queue),
+                    (
+                        f"{parked_duration_seconds * 1000.0:.3f}"
+                        if parked_duration_seconds is not None
+                        else "unknown"
+                    ),
+                )
             return best_batch
         self._record_flowprefill_resume_fallback(single_req_resume_failure)
         logger.debug(
@@ -2373,6 +2515,7 @@ class Scheduler(
             time_stats=recv_req.time_stats,
         )
         req.tokenizer = self.tokenizer
+        self._initialize_flowprefill_scheduling_fields(req, recv_req)
 
         # Handle multimodal inputs
         if recv_req.image_inputs is not None:
@@ -2990,13 +3133,6 @@ class Scheduler(
                     if self.spec_algorithm.is_none()
                     else {}
                 )
-                if batch.forward_mode.is_split_prefill() and batch.split_index > 0:
-                    logger.info(
-                        "FlowPrefill verification: continuing split-prefill forward "
-                        "(rids=%s, split_index=%d, resume_mode=resumed)",
-                        [req.rid for req in batch.reqs],
-                        batch.split_index,
-                    )
                 with self.record_forward_metrics(batch):
                     batch_result = self.model_worker.forward_batch_generation(
                         worker_batch_or_batch,

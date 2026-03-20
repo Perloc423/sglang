@@ -30,7 +30,11 @@ The current implementation uses the same priority direction as priority scheduli
 - By default, larger integer values mean higher priority.
 - If `--schedule-low-priority-values-first` is enabled, smaller integer values mean higher priority.
 
-Only `priority_fcfs` is currently supported for FlowPrefill batch ordering. Among requests with the same priority, older requests win.
+`priority_fcfs` is the current production policy. `deadline_fcfs` and `slack_edf`
+are already accepted by the CLI, and the request path can now carry deadline /
+slack metadata into the scheduler. They still do not have a remaining-time
+predictor behind them, so they remain experimental. Among requests with the same
+effective priority, older requests win.
 
 ## When to use it
 
@@ -68,7 +72,7 @@ If any of these constraints are violated, SGLang will keep serving normally and 
 | `--flowprefill-granularity` | Checkpoint granularity. Only `layer` is supported today. | `layer` |
 | `--flowprefill-split-layers` | Number of transformer layers executed per split-prefill step. Smaller values create more preemption points but add more scheduler handoffs. | `1` |
 | `--flowprefill-max-preemptions` | Maximum cooperative preemptions allowed per request. `0` means unlimited. | `0` |
-| `--flowprefill-priority-policy` | Ordering policy for FlowPrefill. Only `priority_fcfs` is currently supported. | `priority_fcfs` |
+| `--flowprefill-priority-policy` | Ordering policy for FlowPrefill. `priority_fcfs` is the current production policy. `deadline_fcfs` and `slack_edf` are experimental and currently rely on request-supplied metadata plus simple fallback derivation. | `priority_fcfs` |
 
 ## Usage
 
@@ -115,11 +119,19 @@ With `--schedule-low-priority-values-first`, smaller priority integers are consi
 
 - FlowPrefill is currently a **single-engine** optimization, not a replacement for PD disaggregation.
 - It only introduces preemption checkpoints between split-prefill steps, not in the middle of a layer chunk.
-- It currently does not support a deadline-based ordering policy.
+- Deadline/slack-aware ordering is only partially wired today:
+  `deadline_fcfs` and `slack_edf` already accept request metadata through the
+  normal request path, but they are not yet backed by a remaining-time predictor
+  and therefore are still incomplete.
 - It depends on model support for `forward_split_prefill`, so availability varies by model implementation.
 - The current resume path is still transitional:
-  single-request parked prefills may resume from request-owned state, but
-  multi-request parked prefills still fall back to parked-batch resume.
+  single-request parked prefills resume from request-owned state, and
+  multi-request parked prefills are first split into request-owned per-request
+  resume state when it is safe to do so. For parked requests that share the same
+  `split_index` and still satisfy the request-owned resume guard, the scheduler
+  can now regroup them into a split-prefill batch before resuming. Parked-batch
+  resume remains as a compatibility fallback for requests that cannot be sliced
+  safely or no longer have resumable request-owned state.
 - In the current implementation, do not rely on `--max-running-requests 1`
   for cooperative preemption workloads. In the validated `Qwen3-30B-A3B`
   single-request resume path, the urgent request may still need a fresh req
@@ -130,8 +142,9 @@ With `--schedule-low-priority-values-first`, smaller priority integers are consi
   Requests using grammar constraints, `input_embeds`, multimodal inputs, or
   encoder-decoder models fall back to parked-batch resume instead of taking the
   lightweight single-request resume path.
-- Near-term development is not targeting `input_embeds`, grammar-constrained, or
-  multimodal request-owned resume support yet; those remain future compatibility work.
+- Near-term development is not targeting `input_embeds`, grammar-constrained,
+  multimodal, or encoder-decoder request-owned resume support yet; those remain
+  future compatibility work.
 
 ## Troubleshooting
 

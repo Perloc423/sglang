@@ -828,7 +828,10 @@ class Req(ReqDllmMixin):
 
         # For FlowPrefill
         self.prefill_state: PrefillState = PrefillState.WAITING
+        self.prefill_arrival_ts: float = self.arrival_time
         self.prefill_deadline_ts: Optional[float] = None
+        self.prefill_slack: Optional[float] = None
+        self.prefill_predicted_remaining_time: Optional[float] = None
         self.prefill_preempt_pending: bool = False
         self.prefill_num_preemptions: int = 0
         self.prefill_resume_split_index: int = 0
@@ -1580,16 +1583,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             model_config.vocab_size,
         )
         batch.prepare_for_split_prefill()
-        logger.info(
-            "FlowPrefill verification: request-owned resume batch built "
-            "(rid=%s, split_index=%d, prepare_for_extend_skipped=true, "
-            "req_pool_indices_reused=%s, out_cache_loc_reused=%s, seq_lens_cpu_cache_reused=%s)",
-            req.rid,
-            batch.split_index,
-            batch.req_pool_indices is not None,
-            batch.out_cache_loc is not None,
-            batch.seq_lens_cpu_cache is not None,
-        )
         req.sync_flowprefill_ctx_from_batch(batch)
         return batch
 
@@ -1683,19 +1676,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.is_dllm():
             # For DLLM, we use a separate forward mode
             self.forward_mode = ForwardMode.DLLM_EXTEND
-
-        resumed_flowprefill_reqs = [
-            req
-            for req in self.reqs
-            if getattr(req, "prefill_resume_split_index", 0) > 0
-        ]
-        if resumed_flowprefill_reqs:
-            logger.warning(
-                "FlowPrefill verification: resumed request unexpectedly entered prepare_for_extend "
-                "(rids=%s, split_indices=%s); req slot and KV allocation will be re-run",
-                [req.rid for req in resumed_flowprefill_reqs],
-                [req.prefill_resume_split_index for req in resumed_flowprefill_reqs],
-            )
 
         # Init tensors
         reqs = self.reqs

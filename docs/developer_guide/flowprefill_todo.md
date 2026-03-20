@@ -9,8 +9,10 @@ layer-level MVP 与论文
 
 - 已有 layer-level cooperative preemption 的实验版实现。
 - 当前实现已从“batch-level split-prefill resume”进一步推进到
-  “request-owned resume 为主、同 `split_index` regroup 尚未实现”的过渡形态。
-- 当前仅实现 `priority_fcfs`，尚未实现 slack-aware 的 deadline 调度。
+  “request-owned resume + 同 `split_index` regroup 已落地”的过渡形态。
+- 当前已把 `_flowprefill_priority_key()` 重构为 policy dispatcher，
+  并为 `deadline_fcfs` / `slack_edf` 预留接口；完整 slack-aware deadline
+  调度仍未实现。
 - 还未实现 SLO-aware batching、长短 prefill 分流、operator-level
   preemption 和 TP-safe coordinated preemption。
 
@@ -28,7 +30,8 @@ layer-level MVP 与论文
   不再因 logprob 路径退回 parked-batch resume。
 - 多请求 parked batch 已支持最小 request-level resume：
   抢占时会尽量为每个 req 切出 request-owned 的单 req `ForwardBatch`
-  快照，后续按单 req 恢复，不再强依赖 `resume_batch`。
+  快照，并已支持同 `split_index` 的 regroup 恢复，不再强依赖
+  `resume_batch`。
 - 对于无法安全切出单 req 快照的场景，当前仍保留 `resume_batch`
   fallback 作为兼容兜底；这是一层显式过渡，不是最终设计。
 - 单请求 request-owned resume 的 guard 和 fallback reason 已显式化，
@@ -36,11 +39,19 @@ layer-level MVP 与论文
 - 已补一轮初始可观测性：
   有结构化日志区分 single-request resume / parked-batch fallback，
   并已有 parked queue、resume depth、fallback reason 等指标。
+- 已补最小 regroup 能力：
+  对同 `split_index`、且满足 request-owned resume guard 的 parked req，
+  scheduler 可直接重组为 split-prefill batch 恢复，并已把 no-mix 约束
+  固化到实现与单测。
+- 开发期一次性验证日志已完成清理，当前仅保留长期有价值的
+  observability / fallback 日志。
+- `Req` 上已补齐 `arrival/deadline/slack/predicted remaining time`
+  的接口字段；CLI 已接受 `priority_fcfs` / `deadline_fcfs` /
+  `slack_edf`；请求侧 deadline/slack 字段赋值入口也已接通，但
+  predictor 仍未实现。
 
 当前还没有做到的关键点：
 
-- 同 `split_index` 的多请求 regroup 仍未实现；
-  当前多请求 request-level resume 仍以单 req 恢复为主。
 - 单请求 request-owned resume 仍只对安全子集开放：
   非 grammar、非 multimodal、非 input_embeds、非
   encoder-decoder 等。
@@ -53,38 +64,25 @@ layer-level MVP 与论文
   抢占后若 urgent 请求仍需新分配 req slot，scheduler 会在
   `alloc_req_slots()` 阶段失败；当前验证和测试应至少使用
   `--max-running-requests 2`。
-- 还没有接入 slack-aware scheduling，也没有引入 remaining-time predictor。
-- 目前已不再把“多请求 parked req 必须走 parked-batch fallback”作为主路径，
-  但还没有支持同 `split_index` 的 regroup 恢复。
+- 还没有引入 remaining-time predictor，
+  deadline/slack 目前仍主要依赖显式传参或简单缺省推导。
+- 当前 regroup 仍是最小版本：
+  只对同 `split_index`、且满足 request-owned resume guard 的 parked req 生效，
+  更复杂的 regroup / fallback 收缩仍待继续收口。
 
 ## 下一步具体任务
 
-建议下一轮按下面顺序推进；当前可观测性和 `return_logprob`
-单请求恢复已落地，下一步优先收口日志验收、近期 guard 边界，以及最小化的
-多请求 request-level resume：
+建议下一轮按下面顺序推进；当前 regroup、日志 cleanup、以及 policy
+dispatcher 接口桩都已落地，下一步优先把 deadline/slack 输入来源和
+remaining-time predictor 接起来：
 
-### P0：先用实现期日志验收补护栏，再决定哪些约束进入自动化测试
+### Done：实现期日志验收与 cleanup 已完成
 
-- 当前阶段先不要为这些 FlowPrefill 语义约束补单测。
-- 实现阶段优先通过临时结构化日志验证关键语义：
-  单请求恢复不会回到 `prepare_for_extend()`、不会重新分配 req slot /
-  KV、恢复后的 forward 能从非零 `split_index` 继续。
-- 这类验证日志仅作为开发期验收手段使用；功能验收通过后应删除或回收为
-  必要的长期 observability，不保留一次性调试日志。
-- 在真正进入稳定化/回归收口阶段之前，再决定是否把其中一部分约束沉淀为
-  自动化测试。
-- 增加一个更贴近真实实现的日志验收项，验证单请求恢复路径不会回到
-  `prepare_for_extend()`，也不会重新分配 KV。
-- `Qwen3-30B-A3B` 已完成一轮单请求恢复真实性验证：
-  恢复后的 forward 能从 `split_index > 0` 继续。
-- 后续先补齐实现期日志验收：
-  以 `Qwen3-30B-A3B` 为准，确认“非零 `split_index` 恢复”在真实运行中稳定成立。
-- 补一条回归约束：
-  当前 `Qwen3-30B-A3B` 验证场景下不要使用 `--max-running-requests 1`，
-  否则 urgent 请求可能在抢占后因 req slot 不足触发
-  `alloc_req_slots()` 失败。
-- 为刚落地的 observability 补最小日志验收项：
-  single-request resume、parked-batch fallback、fallback reason、resume depth。
+- 已用开发期结构化日志完成：
+  非零 `split_index` 恢复、request-owned resume 不回到
+  `prepare_for_extend()`、以及 regroup 恢复链路验收。
+- 一次性验证日志已删除，仅保留长期 observability / fallback 日志。
+- 后续若进入更严格回归阶段，再决定哪些语义约束需要沉淀为稳定测试。
 
 ### P1：清理近期需要的 guard 边界
 
@@ -92,42 +90,41 @@ layer-level MVP 与论文
 - `input_embeds`、grammar、multimodal 暂时不做，转入未来兼容性规划。
 - 对短期内不准备支持的限制，在用户文档和日志里继续明确说明。
 
-### P2：多请求 request-level resume 的最小版本已落地
+### Done：多请求 request-level resume 的最小版本已落地
 
 - 已支持最保守版本：
   抢占时尽量把多请求 parked batch 切成 request-owned 的单 req 恢复态，
-  后续按单 req 恢复，不做 regroup。
-- 当前验收结果表明，在已覆盖 workload 下，多请求恢复已可走
-  `single_request` 路径，不再以
+  后续优先按 request-owned 路径恢复。
+- 当前验收结果表明，在已覆盖 workload 下，多请求恢复已不再以
   `resume batch has multiple requests` fallback 为主。
 - 仍保留 `resume_batch` fallback 兜底，用于无法安全切片的场景；
   这层兼容在进入 regroup 之后再评估是否完全移除。
 
-### P3：支持同 `split_index` 的 regroup
+### Done：支持同 `split_index` 的 regroup
 
-- 下一步重点转为支持相同 `split_index` 的多个 req regroup。
-- regroup 的目标是：
-  让已被切成 request-owned 单 req 恢复态的 parked req，
-  能在满足安全约束时重新组成同一 split-prefill batch 恢复。
-- 继续禁止不同 `split_index` 混批，并把 no-mix 约束固化到实现与后续回归手段。
-- regroup 完成后，再评估是否删除多请求 `resume_batch` fallback 兼容层。
+- 已支持同 `split_index`、且满足 request-owned resume guard 的 parked req
+  重新组为 split-prefill batch 恢复。
+- 已继续禁止不同 `split_index` 混批，并把 no-mix 约束固化到实现与单测。
+- 下一步不再是“是否做 regroup”，而是继续评估是否收缩
+  `resume_batch` fallback 兼容层。
 
-### P4：为后续 slack-aware scheduling 预留接口
+### Done：把 deadline/slack 输入来源接起来
 
-- 在 `Req` 上补齐 arrival/deadline/slack/remaining-time 需要的字段。
-- 把 `_flowprefill_priority_key()` 重构成 policy dispatcher，
-  为 `deadline_fcfs` 和 `slack_edf` 做接口预留。
-- 先加接口桩，不急着实现完整策略。
+- 已在 `Req` 上补齐 arrival/deadline/slack/remaining-time 需要的字段。
+- 已把 `_flowprefill_priority_key()` 重构成 policy dispatcher，
+  并为 `deadline_fcfs` 和 `slack_edf` 加好接口桩。
+- 已把这些字段接入 `GenerateReqInput -> TokenizedGenerateReqInput -> Req`
+  的请求路径，并支持从 `prefill_ttft_slo_ms` 推导 deadline，
+  以及在已有 deadline / remaining-time 时做最小 slack 推导。
+- 当前仍不应把 `deadline_fcfs` / `slack_edf` 视为完整可用策略；
+  在 predictor 接入前，它们仍主要依赖显式传参或简单缺省推导。
 
-### Cleanup：删除本轮实现期验证日志
+### P5：引入 lightweight remaining-time predictor
 
-- 当前阶段用于验收的临时日志包括：
-  request-owned resume batch built、
-  continuing split-prefill forward、
-  captured request-owned resume state、
-  以及 prepare_for_extend 异常告警。
-- 在 regroup 方案跑通并完成一轮验收后，删除这批一次性验证日志。
-- 删除时只保留长期有价值的 observability，不保留开发期调试噪声。
+- 为 `prefill_predicted_remaining_time` 提供最小可用来源，
+  先支持低成本 heuristic / lightweight predictor。
+- 在 predictor 接入后，再评估 `slack_edf` 的最小可用行为和 benchmark
+  方案。
 
 ### Future：兼容性扩展规划
 
