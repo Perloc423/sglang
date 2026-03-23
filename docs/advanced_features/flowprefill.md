@@ -31,16 +31,19 @@ The current implementation uses the same priority direction as priority scheduli
 - If `--schedule-low-priority-values-first` is enabled, smaller integer values mean higher priority.
 
 `priority_fcfs` is the current production policy. `deadline_fcfs` and `slack_edf`
-are already accepted by the CLI, and the request path can now carry deadline /
-slack metadata into the scheduler. A lightweight remaining-time predictor is
-also wired in for requests that do not provide explicit
-`prefill_predicted_remaining_time`: the scheduler estimates remaining prefill
-time from observed split-prefill runtime per layer. Explicit request metadata
-still wins over the heuristic. You can also configure a server-wide default
-deadline source with `--flowprefill-default-ttft-slo-ms`, which is used only
-when a request does not explicitly provide `prefill_ttft_slo_ms` or
-`prefill_deadline_ts`. These policies remain experimental, and among requests
-with the same effective priority, older requests win.
+are experimental. `slack_edf` now uses a first-pass feasible-first S-EDF:
+
+- compute `deadline = arrival_time + TTFT_SLO`
+- compute `slack = deadline - now - TTFT_hat`
+- prefer requests with `slack >= 0`
+- within the feasible set, smaller slack wins
+- infeasible requests are globally deprioritized, then ordered by deadline / FCFS
+
+`TTFT_SLO` can come from per-request metadata or the server-wide
+`--flowprefill-default-ttft-slo-ms`. `TTFT_hat` is still a lightweight heuristic
+predictor based on observed split-prefill runtime per layer, so this policy is
+not benchmark-calibrated yet. Among requests with the same effective priority,
+older requests still win.
 
 ## When to use it
 
@@ -78,7 +81,7 @@ If any of these constraints are violated, SGLang will keep serving normally and 
 | `--flowprefill-granularity` | Checkpoint granularity. Only `layer` is supported today. | `layer` |
 | `--flowprefill-split-layers` | Number of transformer layers executed per split-prefill step. Smaller values create more preemption points but add more scheduler handoffs. | `1` |
 | `--flowprefill-max-preemptions` | Maximum cooperative preemptions allowed per request. `0` means unlimited. | `0` |
-| `--flowprefill-priority-policy` | Ordering policy for FlowPrefill. `priority_fcfs` is the current production policy. `deadline_fcfs` and `slack_edf` are experimental; they can use request-supplied metadata and a lightweight heuristic remaining-time predictor. | `priority_fcfs` |
+| `--flowprefill-priority-policy` | Ordering policy for FlowPrefill. `priority_fcfs` is the current production policy. `deadline_fcfs` and `slack_edf` are experimental; `slack_edf` uses a feasible-first S-EDF with a lightweight heuristic TTFT predictor. | `priority_fcfs` |
 | `--flowprefill-default-ttft-slo-ms` | Default TTFT SLO in milliseconds used to derive FlowPrefill deadlines when requests do not explicitly provide `prefill_ttft_slo_ms` or `prefill_deadline_ts`. | `None` |
 
 ## Usage
@@ -132,13 +135,12 @@ With `--schedule-low-priority-values-first`, smaller priority integers are consi
 - It only introduces preemption checkpoints between split-prefill steps, not in the middle of a layer chunk.
 - Deadline/slack-aware ordering is still experimental:
   `deadline_fcfs` and `slack_edf` accept request metadata through the normal
-  request path, and missing `prefill_predicted_remaining_time` can now be
-  filled by a lightweight heuristic predictor based on observed split-prefill
-  runtime per layer. This is a minimal estimator, not yet a benchmarked or
-  calibrated production policy. In particular, a uniform server-level default
-  SLO can interact badly with mixed long/short workloads: long requests may
-  quickly become hopelessly negative-slack and distort scheduling away from the
-  intended urgent-first behavior.
+  request path, and missing `TTFT_hat` is still filled by a lightweight
+  heuristic predictor based on observed split-prefill runtime per layer. The
+  scheduler now uses a feasible-first `slack_edf`, but this is still a minimal
+  estimator, not yet a benchmarked or calibrated production policy. In
+  particular, a uniform server-level default SLO can still interact badly with
+  mixed long/short workloads.
 - It depends on model support for `forward_split_prefill`, so availability varies by model implementation.
 - The current resume path is still transitional:
   single-request parked prefills resume from request-owned state, and

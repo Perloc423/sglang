@@ -1587,6 +1587,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             model_config.vocab_size,
         )
         batch.prepare_for_split_prefill()
+        # Request-owned FlowPrefill resume reconstructs the runtime batch from a
+        # parked ForwardBatch snapshot. The attention backend keeps its own
+        # forward metadata outside ForwardBatch, so resumed batches must force a
+        # metadata rebuild before the next split-prefill step.
+        batch.split_attn_backend_needs_reinit = True
         req.sync_flowprefill_ctx_from_batch(batch)
         return batch
 
