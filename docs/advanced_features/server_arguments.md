@@ -141,7 +141,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--flowprefill-granularity` | Checkpoint granularity for FlowPrefill. Only `layer` is currently supported. | `layer` | `layer` |
 | `--flowprefill-split-layers` | Number of layers to execute in each split-prefill step when FlowPrefill is enabled. | `1` | Type: int |
 | `--flowprefill-max-preemptions` | Maximum number of cooperative preemptions allowed per request when FlowPrefill is enabled. `0` means unlimited. | `0` | Type: int |
-| `--flowprefill-priority-policy` | Ordering policy for FlowPrefill. Only `priority_fcfs` is currently supported. | `priority_fcfs` | `priority_fcfs` |
+| `--flowprefill-priority-policy` | Ordering policy for FlowPrefill. `priority_fcfs` is the default. `deadline_fcfs` and `slack_edf` are also available as experimental policies; `slack_edf` uses a feasible-first S-EDF with heuristic TTFT prediction. | `priority_fcfs` | `priority_fcfs`, `deadline_fcfs`, `slack_edf` |
 | `--schedule-conservativeness` | How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently. | `1.0` | Type: float |
 | `--page-size` | The number of tokens in a page. | `1` | Type: int |
 | `--swa-full-tokens-ratio` | The ratio of SWA layer KV tokens / full layer KV tokens, regardless of the number of swa:full layers. It should be between 0 and 1. E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens. | `0.8` | Type: float |

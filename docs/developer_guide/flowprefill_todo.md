@@ -11,8 +11,19 @@ layer-level MVP 与论文
 - 当前实现已从“batch-level split-prefill resume”进一步推进到
   “request-owned resume + 同 `split_index` regroup 已落地”的过渡形态。
 - 当前已把 `_flowprefill_priority_key()` 重构为 policy dispatcher，
-  并为 `deadline_fcfs` / `slack_edf` 预留接口；完整 slack-aware deadline
+  并已把 `deadline_fcfs` / `slack_edf` 接入最小的 heuristic predictor；
+  第一版 feasible-first 的 S-EDF 已落地，但完整 slack-aware deadline
   调度仍未实现。
+- 当前 `slack_edf` 已按论文定义计算
+  `slack = deadline - now - TTFT_hat`，并在排序上先保护
+  `slack >= 0` 的 feasible 请求，再整体降权 `slack < 0` 的请求。
+- 当前仍只是第一版策略收口：
+  `TTFT_SLO` 主要来自 server 级默认值，`TTFT_hat` 仍由 lightweight
+  heuristic predictor 提供，还没有 workload-aware 校准。
+- 当前 heuristic predictor 已从“单一全局平均层耗时”升级为三级回退：
+  优先使用 request-local split 观测，其次使用按 prompt length 分桶的
+  bucket 观测，最后才退回 scheduler-global 观测；但它仍属于轻量启发式，
+  还没有引入更细的 batch-shape / runtime 校准。
 - 还未实现 SLO-aware batching、长短 prefill 分流、operator-level
   preemption 和 TP-safe coordinated preemption。
 
@@ -47,8 +58,14 @@ layer-level MVP 与论文
   observability / fallback 日志。
 - `Req` 上已补齐 `arrival/deadline/slack/predicted remaining time`
   的接口字段；CLI 已接受 `priority_fcfs` / `deadline_fcfs` /
-  `slack_edf`；请求侧 deadline/slack 字段赋值入口也已接通，但
-  predictor 仍未实现。
+  `slack_edf`；请求侧 deadline/slack 字段赋值入口也已接通。
+- 已接入一版 lightweight heuristic predictor：
+  对未显式提供 `prefill_predicted_remaining_time` 的请求，scheduler
+  会根据 split-prefill 的观测层耗时估计 remaining prefill time，并用于
+  `slack_edf` 的缺省 slack 计算。
+- 已补 server 级默认 SLO 参数：
+  当请求未显式提供 `prefill_ttft_slo_ms` / `prefill_deadline_ts` 时，
+  可由 `--flowprefill-default-ttft-slo-ms` 统一推导 deadline。
 
 当前还没有做到的关键点：
 
@@ -64,17 +81,53 @@ layer-level MVP 与论文
   抢占后若 urgent 请求仍需新分配 req slot，scheduler 会在
   `alloc_req_slots()` 阶段失败；当前验证和测试应至少使用
   `--max-running-requests 2`。
-- 还没有引入 remaining-time predictor，
-  deadline/slack 目前仍主要依赖显式传参或简单缺省推导。
+- 当前 remaining-time predictor 仍是最小 heuristic 版本，
+  deadline/slack 尚未经过 benchmark 校准，也还没有更强的 workload-aware
+  predictor。
+- 当前 predictor 虽已补 prompt-length bucket 化，但仍未引入更强的
+  TTFT normalization、EMA、batch-shape-aware latency model，因此
+  `slack_edf` 的最终效果仍需继续通过 benchmark 校准。
+- 当前 `slack_edf` 已切到 feasible-first 语义：
+  waiting queue、preempt 判断、以及 preempted queue 恢复都复用同一套
+  request priority key，不再出现“更负 slack 反而更优先”的行为。
+- 当前已尝试在 `slack_edf` 下引入第一版 waiting-side candidate batching：
+  先从 waiting queue 选 seed，再吸收同 prompt bucket、且不会让 seed
+  立即违反 SLO 的请求，形成 waiting candidate batch，并把这个 candidate
+  的 key 拿去和 preempted candidate 比较。
+- 当前 waiting-side candidate batching 已进一步升级：
+  在保留“seed 不违约”约束的基础上，新增 queue externality / `harm(candidate)`
+  惩罚项，并在 seed 选择上优先保护 feasible 的 short-bucket 请求。
+- 当前 `harm(candidate)` 的核心语义是：
+  统计“如果现在调度这个 waiting candidate，会让多少当前仍 feasible 的
+  waiting 请求在额外等待这一个 candidate 的服务时间后转成 infeasible”。
+- 在本轮 benchmark 上，这一版 `slack_edf` 已明显优于当前 `priority_fcfs`
+  基线：在 `bg_rate=2/4/6/8`、统一 `TTFT_SLO=300ms` 的测试矩阵里，
+  urgent goodput 已达到 `12/12`，而 background 在高负载下退到 `6/8`，
+  说明策略已开始显式为 urgent 让路，而不再系统性保护 background。
+- 这一轮开发中还修复了一个 waiting candidate 相关的回归：
+  当 seed 不在队首时，candidate 构造可能把同一 `rid` 重复加入 batch，
+  进而触发 `token_to_kv_pool_allocator memory leak detected`。
+  当前已通过 `candidate_rids` 去重和回归单测修复该问题。
+- 但当前 infeasible 请求的降权仍是最小版本：
+  先整体落到 feasible 请求之后，再在 infeasible 集合内按 deadline/FCFS
+  收口；是否需要更细的 goodput-aware 惩罚或 anti-starvation 机制，仍待 benchmark。
+- 已确认 split-prefill runtime 观测链路现已生效，`predicted remaining`
+  与 `effective slack` 都能在调试日志中看到非空值；之前 runtime 全为 0
+  的问题来自只对 `EXTEND` 记录 prefill runtime，现已修复为对
+  `SPLIT_PREFILL` 也记录。
+- benchmark 已确认，“裸 `slack_edf` + 统一默认 TTFT SLO”确实不是可用终态；
+  但在加入 prompt-bucket predictor、`k=8` request-local 冷启动保护、
+  waiting candidate batching、short-seed 偏置、以及 `harm(candidate)`
+  之后，`slack_edf` 已在当前主 workload 上表现出明确收益。
 - 当前 regroup 仍是最小版本：
   只对同 `split_index`、且满足 request-owned resume guard 的 parked req 生效，
   更复杂的 regroup / fallback 收缩仍待继续收口。
 
 ## 下一步具体任务
 
-建议下一轮按下面顺序推进；当前 regroup、日志 cleanup、以及 policy
-dispatcher 接口桩都已落地，下一步优先把 deadline/slack 输入来源和
-remaining-time predictor 接起来：
+建议下一轮按下面顺序推进；当前 regroup、日志 cleanup、deadline/slack
+请求通路、以及 heuristic predictor 都已落地，下一步优先做 benchmark
+和策略校准：
 
 ### Done：实现期日志验收与 cleanup 已完成
 
@@ -116,15 +169,60 @@ remaining-time predictor 接起来：
 - 已把这些字段接入 `GenerateReqInput -> TokenizedGenerateReqInput -> Req`
   的请求路径，并支持从 `prefill_ttft_slo_ms` 推导 deadline，
   以及在已有 deadline / remaining-time 时做最小 slack 推导。
+- 已支持 `--flowprefill-default-ttft-slo-ms`，作为请求未显式提供
+  `prefill_ttft_slo_ms` / `prefill_deadline_ts` 时的 server 级默认值。
 - 当前仍不应把 `deadline_fcfs` / `slack_edf` 视为完整可用策略；
-  在 predictor 接入前，它们仍主要依赖显式传参或简单缺省推导。
+  它们已经具备请求元数据通路，但还缺少 benchmark 驱动的调参与策略收口。
 
-### P5：引入 lightweight remaining-time predictor
+### Done：引入 lightweight remaining-time predictor
 
-- 为 `prefill_predicted_remaining_time` 提供最小可用来源，
-  先支持低成本 heuristic / lightweight predictor。
-- 在 predictor 接入后，再评估 `slack_edf` 的最小可用行为和 benchmark
-  方案。
+- 已为 `prefill_predicted_remaining_time` 提供最小可用来源：
+  对未显式传入 remaining time 的请求，优先使用 request-local 的
+  split-prefill 观测均值；没有 request-local 观测时，再使用按 prompt
+  length 分桶的 bucket 观测；bucket 里也没有数据时，才退到 scheduler
+  级的全局观测均值。
+- 当前分桶边界是：
+  1. `<= 512`
+  2. `513 - 2048`
+  3. `> 2048`
+- 当前 heuristic 仍基于
+  `remaining layers * observed average layer latency`，但至少已经把
+  `128 token urgent` 和 `8k background` 这类请求从同一个全局 latency
+  统计里拆开。
+- 显式传入的 `prefill_predicted_remaining_time` 与 `prefill_slack`
+  仍然优先于 heuristic。
+- 已通过开发期调试日志验证：
+  修复 split-prefill runtime 采集后，新请求可先从 bucket/global 均值拿到
+  初始 `predicted_remaining_time`，已运行请求则会逐步切换到 request-local
+  观测均值。
+
+### P6：策略收口与 benchmark 校准
+
+- 在真实 workload 和 benchmark harness 上比较：
+  `priority_fcfs`、`deadline_fcfs`、`slack_edf`。
+- 重点观察 TTFT、goodput、deadline miss rate，以及 preempt/resume 次数。
+- 当前阶段结论已经更新：
+  `slack_edf` 的关键不再只是“是否采用 feasible-first”，而是要把
+  predictor、waiting candidate batching、以及 queue externality
+  一起收口成同一套策略。
+- 当前已完成并验证有效的收口项：
+  1. prompt-length bucket predictor
+  2. `k=8` request-local predictor 冷启动保护
+  3. waiting candidate batching
+  4. feasible short-bucket seed 优先
+  5. `harm(candidate)` 惩罚
+- 当前主 workload 的阶段性 benchmark 结果：
+  1. `priority_fcfs` 在 `bg_rate=2/4/6/8` 下的 urgent goodput 为
+     `8/12`, `3/12`, `4/12`, `4/12`
+  2. `slack_edf` 在同一矩阵下的 urgent goodput 为
+     `12/12`, `12/12`, `12/12`, `12/12`
+  3. `slack_edf` 的 tradeoff 是在 `bg_rate=6/8` 时 background 从 `8/8`
+     降到 `6/8`
+- 因此，P6 的下一步不再是“是否要引入 queue externality”，而是：
+  1. 在更多 SLO 与负载区间验证当前版本是否稳定
+  2. 继续与 `deadline_fcfs` 做 apples-to-apples 对比
+  3. 评估是否还需要更强的 EMA / batch-shape-aware predictor
+  4. 评估是否需要 anti-starvation 保护，避免 background 在更高压场景下被长期饿死
 
 ### Future：兼容性扩展规划
 
@@ -188,6 +286,15 @@ predicted remaining prefill time 做调度。
 目标：围绕最高优请求 `H` 组 batch，并保证“为了提高利用率而加入其他请求”
 不会让 `H` 违约。
 
+补充说明：
+
+- 当前仓库已经有一版最小 waiting-side candidate batching，但实验结果表明，
+  只保护 `H` 自己仍然不够。
+- 论文式 batching 不能只把 `H` 当作唯一目标；在 mixed workload 里，
+  还需要把该 batch 对整个 waiting queue 的阻塞外部性算进去。
+- 因此本阶段的下一版目标不再只是“protect `H`”，而是：
+  `protect H while minimizing collateral SLO damage to other feasible waiting requests`。
+
 ### M4：引入长短 prefill 分流
 
 目标：把短请求的 batching 优化和长请求的 preemptibility 优化分开处理，
@@ -247,7 +354,18 @@ predicted remaining prefill time 做调度。
 - 在完整 Python 测试环境下跑通现有 scheduler 单测。
 - 当前已补单测覆盖：
   single-request request-owned resume、parked-batch fallback resume、
-  fallback reason、`return_logprob` 单请求恢复。
+  fallback reason、`return_logprob` 单请求恢复，以及 predictor 的
+  request-local / bucket / global 回退顺序。
+- 本机若遇到 `flashinfer-jit-cache version ... does not match flashinfer version`
+  的环境问题，可在运行相关单测前设置下面这些环境变量：
+
+```bash
+FLASHINFER_DISABLE_VERSION_CHECK=1 \
+HOME=/tmp \
+XDG_CACHE_HOME=/tmp \
+PYTHONPATH=/share/wwmq/mywork/sglang/python \
+python -m pytest test/registered/unit/managers/test_flowprefill_scheduler.py -q
+```
 - 增加一类专门针对 request-owned resume 的测试：
   单请求 parked req 从 `Req.flowprefill_ctx` 重建 batch，并且不走
   `prepare_for_extend()` / 不重新分配 KV。
