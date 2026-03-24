@@ -129,8 +129,59 @@ With `--schedule-low-priority-values-first`, smaller priority integers are consi
   `slack_edf` perform worse than `priority_fcfs`. Prefer explicit request
   deadlines or at least different deadline classes for different workloads.
 
+## Benchmarking and debugging
+
+The repository contains two useful local benchmark helpers under
+[`benchmark/flowprefill`](/share/wwmq/mywork/sglang/benchmark/flowprefill):
+
+- [`build_qwentrace_workload.py`](/share/wwmq/mywork/sglang/benchmark/flowprefill/build_qwentrace_workload.py)
+  converts the public Bailian trace into a FlowPrefill-friendly workload with
+  per-request task type, arrival timing, prompt length, output length, and TTFT
+  SLO metadata.
+- [`bench_flowprefill_trace_replay.py`](/share/wwmq/mywork/sglang/benchmark/flowprefill/bench_flowprefill_trace_replay.py)
+  replays that workload against the native `/generate` API and can attach
+  `priority` and `prefill_ttft_slo_ms` per request.
+
+For TTFT-focused experiments, use:
+
+```bash
+python sglang/benchmark/flowprefill/bench_flowprefill_trace_replay.py \
+  --model /path/to/model \
+  --workload-file sglang/benchmark/flowprefill/qwentrace_flowprefill_qwen2.5-14b.jsonl \
+  --output-file sglang/benchmark/flowprefill/qwentrace_result.json \
+  --window-start-seconds 300 \
+  --time-window-seconds 120 \
+  --print-window-summary \
+  --override-max-new-tokens 1
+```
+
+`--override-max-new-tokens 1` is important when the question is
+"does FlowPrefill help TTFT/prefill scheduling?" because it removes long decode
+tails from the benchmark. Without this, decode-heavy requests can dominate the
+results and hide prefill-side behavior.
+
+Prefer selecting a **contiguous time window** from the trace instead of random
+request shuffling. This preserves a more realistic request-rate pattern and
+keeps the replay closer to the original production trace.
+
+For `slack_edf`, also enable scheduler timeline logging and inspect:
+
+- per-request `deadline_ms`
+- `predicted_remaining_ms`
+- `slack_ms`
+- `preempt_pending`
+- parked/resume behavior
+
+This is often the fastest way to distinguish:
+
+- predictor error
+- decode-bound overload
+- and actual prefill head-of-line blocking
+
 ## Limitations
 
+- For implementation-specific caveats observed in current replay experiments,
+  see [FlowPrefill Current Limitations and Mitigations](../developer_guide/flowprefill_limitations.md).
 - FlowPrefill is currently a **single-engine** optimization, not a replacement for PD disaggregation.
 - It only introduces preemption checkpoints between split-prefill steps, not in the middle of a layer chunk.
 - Deadline/slack-aware ordering is still experimental:

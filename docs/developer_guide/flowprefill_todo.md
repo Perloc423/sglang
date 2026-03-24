@@ -119,6 +119,15 @@ layer-level MVP 与论文
   但在加入 prompt-bucket predictor、`k=8` request-local 冷启动保护、
   waiting candidate batching、short-seed 偏置、以及 `harm(candidate)`
   之后，`slack_edf` 已在当前主 workload 上表现出明确收益。
+- 结合最新的本地 `QwenTrace` replay，尤其是
+  `benchmark/flowprefill/bench_flowprefill_trace_replay.py` 配合
+  `--override-max-new-tokens 1` 的 decode-controlled TTFT 实验，
+  当前 `slack_edf` 又暴露出一个新的局限：
+  紧 SLO 的短请求一旦被 predictor 判入 infeasible 集，当前
+  feasible-first 排序很难把它们重新“捞回来”。
+- 当前这类问题不再能简单归因于 decode 长尾，因为在 `max_new_tokens=1`
+  的 replay 中，这一现象仍然存在；因此它更像是当前 policy + predictor
+  组合的真实限制。
 - 当前 regroup 仍是最小版本：
   只对同 `split_index`、且满足 request-owned resume guard 的 parked req 生效，
   更复杂的 regroup / fallback 收缩仍待继续收口。
@@ -223,6 +232,69 @@ layer-level MVP 与论文
   2. 继续与 `deadline_fcfs` 做 apples-to-apples 对比
   3. 评估是否还需要更强的 EMA / batch-shape-aware predictor
   4. 评估是否需要 anti-starvation 保护，避免 background 在更高压场景下被长期饿死
+
+### P7：补 short-request rescue / anti-starvation 机制
+
+- 当前 feasible-first `slack_edf` 对“刚刚掉入 infeasible 的短请求”保护不足。
+- 本地 `QwenTrace` replay 表明：
+  aggregate goodput 可以改善，但 `text` 这类 tight-SLO 短请求仍可能系统性恶化。
+- 下一步需要在现有 slack key 之外，增加一层 bounded rescue 逻辑，用于：
+  1. 保护 tight-SLO 的 short-bucket 请求
+  2. 避免它们一旦被 predictor 判成负 slack 就长期失去竞争力
+  3. 让 policy 不只是挑选 still-feasible 请求，而能在受控范围内抢救
+     recently-infeasible 的交互请求
+- 可以比较的实现方向：
+  1. short-bucket rescue window
+  2. age-aware infeasible ordering
+  3. bounded rescue bonus
+  4. class-aware minimum service guarantees
+
+### P8：把 decode-controlled replay 纳入 FlowPrefill benchmark 常规流程
+
+- 当前仓库已经有：
+  1. `benchmark/flowprefill/build_qwentrace_workload.py`
+  2. `benchmark/flowprefill/bench_flowprefill_trace_replay.py`
+  3. `--override-max-new-tokens 1` 用于隔离 TTFT/prefill 效果
+- 后续 benchmark 需要制度化两类结果：
+  1. 原始 output length replay
+  2. `max_new_tokens=1` replay
+- 没有 decode-controlled 对照时，不应直接把 replay 结果解释为
+  “FlowPrefill policy 本身更好/更差”。
+
+### P8.1：把 request-rate 语义固定为连续时间窗口 replay
+
+- 当前 benchmark 的另一个经验结论是：
+  request-rate 语义必须尽量贴近原始 trace，而不能靠随机抽样后再人为重建时间轴。
+- 之前的 `shuffle + truncate + preserve/compact` 思路会引入额外偏差：
+  1. 打乱后失去原始 trace 的局部到达模式
+  2. 抽样后的 delay 重建不再对应真实生产窗口
+  3. 对 FlowPrefill 这类对 arrival pattern 敏感的调度策略，结论容易失真
+- 当前 replay 脚本已经切换到连续时间窗口语义：
+  1. `--window-start-seconds`
+  2. `--time-window-seconds`
+  3. `--max-requests`
+  4. `--print-window-summary`
+- 后续 benchmark 约定应明确：
+  1. 优先使用连续时间窗口
+  2. 固定窗口后再比较不同 policy
+  3. 不再把随机打乱请求集作为默认 benchmark 入口
+- 后续还可以继续补：
+  1. 自动推荐“中等负载”窗口
+  2. 按窗口输出平均 RPS / 按类请求数
+  3. 按窗口批量 sweep，而不是只 sweep 请求数
+
+### P9：继续校准 predictor，重点关注“短请求误判为 infeasible”的场景
+
+- 当前 bucketized heuristic predictor 已经比全局均值更好，但仍不够。
+- 需要新增面向短请求的误判诊断：
+  1. 统计 short-bucket 请求从 arrival 到首次负 slack 的比例
+  2. 统计 false-negative feasibility 的频率
+  3. 区分 cold-start、resumed、regrouped 三类请求
+- 评估方向：
+  1. EMA / smoothing
+  2. batch-shape-aware predictor
+  3. resumed-request-specific normalization
+  4. predictor error versus class-level goodput
 
 ### Future：兼容性扩展规划
 

@@ -165,6 +165,12 @@ class SchedulerOutputProcessorMixin:
 
                 if req.is_chunked <= 0:
                     req.time_stats.set_prefill_finished_time()
+                    self._log_flowprefill_timeline_event(
+                        req,
+                        event="prefill_finished",
+                        now=req.time_stats.prefill_finished_time,
+                        next_token_id=int(next_token_id),
+                    )
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
@@ -174,6 +180,13 @@ class SchedulerOutputProcessorMixin:
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
+                        self._log_flowprefill_timeline_event(
+                            req,
+                            event="completion",
+                            now=req.time_stats.completion_time,
+                            finished_reason=str(req.finished_reason),
+                            output_len=len(req.output_ids),
+                        )
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
 
@@ -290,6 +303,11 @@ class SchedulerOutputProcessorMixin:
                 req.embedding = embeddings[i]
                 if req.is_chunked <= 0:
                     req.time_stats.set_prefill_finished_time()
+                    self._log_flowprefill_timeline_event(
+                        req,
+                        event="prefill_finished",
+                        now=req.time_stats.prefill_finished_time,
+                    )
                     # Dummy output token for embedding models
                     req.output_ids.append(0)
                     req.check_finished()
@@ -297,6 +315,13 @@ class SchedulerOutputProcessorMixin:
                     if req.finished():
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
+                        self._log_flowprefill_timeline_event(
+                            req,
+                            event="completion",
+                            now=req.time_stats.completion_time,
+                            finished_reason=str(req.finished_reason),
+                            output_len=len(req.output_ids),
+                        )
                     else:
                         self.tree_cache.cache_unfinished_req(req)
                 else:
@@ -452,6 +477,13 @@ class SchedulerOutputProcessorMixin:
                     release_kv_cache(req, self.tree_cache)
 
                 req.time_stats.set_completion_time()
+                self._log_flowprefill_timeline_event(
+                    req,
+                    event="completion",
+                    now=req.time_stats.completion_time,
+                    finished_reason=str(req.finished_reason),
+                    output_len=len(req.output_ids),
+                )
 
             self.maybe_collect_customized_info(i, req, logits_output)
 

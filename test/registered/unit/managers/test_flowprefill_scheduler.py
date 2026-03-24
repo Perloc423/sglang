@@ -620,6 +620,66 @@ class TestFlowPrefillScheduler(CustomTestCase):
             ["waiting_short", "harmed_waiting"],
         )
 
+    def test_slack_edf_waiting_candidate_can_opportunistically_mix_long_member(self):
+        self.scheduler.server_args.flowprefill_priority_policy = "slack_edf"
+
+        seed_req = make_req("seed", priority=1, wait_time=1.0)
+        seed_req.origin_input_ids = [1] * 120
+        seed_req.origin_input_ids_unpadded = [1] * 120
+        seed_req.prefill_deadline_ts = 100.0
+        seed_req.prefill_predicted_remaining_time = 0.10
+
+        long_req = make_req("long", priority=1, wait_time=1.1)
+        long_req.origin_input_ids = [1] * 8000
+        long_req.origin_input_ids_unpadded = [1] * 8000
+        long_req.prefill_deadline_ts = 100.4
+        long_req.prefill_predicted_remaining_time = 0.005
+
+        self.scheduler.waiting_queue = [seed_req, long_req]
+
+        with patch("sglang.srt.managers.scheduler.time.perf_counter", return_value=99.7):
+            selected = self.scheduler._get_next_flowprefill_candidate()
+
+        self.assertIsNone(selected)
+        self.assertEqual(
+            self.scheduler._flowprefill_selected_waiting_candidate_rids,
+            ["seed", "long"],
+        )
+
+    def test_slack_edf_waiting_candidate_rejects_mixed_long_member_if_it_harms_protected_short(
+        self,
+    ):
+        self.scheduler.server_args.flowprefill_priority_policy = "slack_edf"
+
+        seed_req = make_req("seed", priority=1, wait_time=1.0)
+        seed_req.origin_input_ids = [1] * 120
+        seed_req.origin_input_ids_unpadded = [1] * 120
+        seed_req.prefill_deadline_ts = 99.9
+        seed_req.prefill_predicted_remaining_time = 0.10
+
+        harmed_short = make_req("harmed_short", priority=1, wait_time=1.1)
+        harmed_short.origin_input_ids = [1] * 130
+        harmed_short.origin_input_ids_unpadded = [1] * 130
+        harmed_short.prefill_deadline_ts = 100.105
+        harmed_short.prefill_predicted_remaining_time = 0.30
+
+        long_req = make_req("long", priority=1, wait_time=1.2)
+        long_req.origin_input_ids = [1] * 8000
+        long_req.origin_input_ids_unpadded = [1] * 8000
+        long_req.prefill_deadline_ts = 100.4
+        long_req.prefill_predicted_remaining_time = 0.21
+
+        self.scheduler.waiting_queue = [seed_req, harmed_short, long_req]
+
+        with patch("sglang.srt.managers.scheduler.time.perf_counter", return_value=99.7):
+            selected = self.scheduler._get_next_flowprefill_candidate()
+
+        self.assertIsNone(selected)
+        self.assertEqual(
+            self.scheduler._flowprefill_selected_waiting_candidate_rids,
+            ["seed"],
+        )
+
     def test_incoming_infeasible_request_does_not_preempt_feasible_running_batch(self):
         self.scheduler.server_args.flowprefill_priority_policy = "slack_edf"
         running_req = make_req("running", priority=1, wait_time=10.0)
