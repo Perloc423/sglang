@@ -29,6 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -431,6 +432,313 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+
+    def slice_for_flowprefill_req(self, req_index: int) -> Optional["ForwardBatch"]:
+        """Create a single-request split-prefill snapshot from a batched forward state."""
+
+        if self.batch_size == 1:
+            return self
+        if self.model_specific_states is not None:
+            return None
+
+        token_start = (
+            int(self.extend_start_loc[req_index].item())
+            if self.extend_start_loc is not None
+            else sum(int(x) for x in self.extend_seq_lens_cpu[:req_index])
+        )
+        token_len = (
+            int(self.extend_seq_lens[req_index].item())
+            if self.extend_seq_lens is not None
+            else self.extend_seq_lens_cpu[req_index]
+        )
+        token_end = token_start + token_len
+
+        def slice_batch_tensor(
+            tensor: Optional[torch.Tensor],
+        ) -> Optional[torch.Tensor]:
+            return None if tensor is None else tensor[req_index : req_index + 1]
+
+        def slice_token_tensor(
+            tensor: Optional[torch.Tensor],
+        ) -> Optional[torch.Tensor]:
+            return None if tensor is None else tensor[token_start:token_end]
+
+        def slice_token_positions(
+            tensor: Optional[torch.Tensor],
+        ) -> Optional[torch.Tensor]:
+            if tensor is None:
+                return None
+            if tensor.dim() <= 1:
+                return tensor[token_start:token_end]
+            return tensor[:, token_start:token_end]
+
+        sliced = copy.copy(self)
+        sliced.batch_size = 1
+        sliced.input_ids = slice_token_tensor(self.input_ids)
+        sliced.req_pool_indices = slice_batch_tensor(self.req_pool_indices)
+        sliced.seq_lens = slice_batch_tensor(self.seq_lens)
+        sliced.out_cache_loc = slice_token_tensor(self.out_cache_loc)
+        sliced.seq_lens_sum = (
+            int(sliced.seq_lens[0].item()) if sliced.seq_lens is not None else 0
+        )
+        sliced.orig_seq_lens = slice_batch_tensor(self.orig_seq_lens)
+        sliced.out_cache_loc_swa = slice_token_tensor(self.out_cache_loc_swa)
+        sliced.mamba_track_indices = slice_batch_tensor(self.mamba_track_indices)
+        sliced.mamba_track_mask = slice_batch_tensor(self.mamba_track_mask)
+        sliced.mamba_track_seqlens = slice_batch_tensor(self.mamba_track_seqlens)
+        sliced.seq_lens_cpu = slice_batch_tensor(self.seq_lens_cpu)
+        sliced.top_logprobs_nums = (
+            None
+            if self.top_logprobs_nums is None
+            else [self.top_logprobs_nums[req_index]]
+        )
+        sliced.token_ids_logprobs = (
+            None
+            if self.token_ids_logprobs is None
+            else [self.token_ids_logprobs[req_index]]
+        )
+        sliced.temperature = slice_batch_tensor(self.temperature)
+        sliced.top_p = slice_batch_tensor(self.top_p)
+        sliced.positions = slice_token_positions(self.positions)
+        sliced.extend_num_tokens = token_len
+        sliced.extend_seq_lens = slice_batch_tensor(self.extend_seq_lens)
+        sliced.extend_prefix_lens = slice_batch_tensor(self.extend_prefix_lens)
+        sliced.extend_start_loc = (
+            None
+            if self.extend_start_loc is None
+            else self.extend_start_loc.new_zeros((1,))
+        )
+        sliced.extend_prefix_lens_cpu = (
+            None
+            if self.extend_prefix_lens_cpu is None
+            else [self.extend_prefix_lens_cpu[req_index]]
+        )
+        sliced.extend_seq_lens_cpu = (
+            None
+            if self.extend_seq_lens_cpu is None
+            else [self.extend_seq_lens_cpu[req_index]]
+        )
+        sliced.extend_logprob_start_lens_cpu = (
+            None
+            if self.extend_logprob_start_lens_cpu is None
+            else [self.extend_logprob_start_lens_cpu[req_index]]
+        )
+        sliced.extend_input_logprob_token_ids_gpu = slice_token_tensor(
+            self.extend_input_logprob_token_ids_gpu
+        )
+        sliced.hidden_states = slice_token_tensor(self.hidden_states)
+        sliced.residual = slice_token_tensor(self.residual)
+        sliced.mm_inputs = None if self.mm_inputs is None else [self.mm_inputs[req_index]]
+        sliced.encoder_cached = (
+            None if self.encoder_cached is None else [self.encoder_cached[req_index]]
+        )
+        sliced.encoder_lens = slice_batch_tensor(self.encoder_lens)
+        sliced.encoder_lens_cpu = (
+            None if self.encoder_lens_cpu is None else [self.encoder_lens_cpu[req_index]]
+        )
+        sliced.encoder_out_cache_loc = slice_token_tensor(self.encoder_out_cache_loc)
+        sliced.lora_ids = None if self.lora_ids is None else [self.lora_ids[req_index]]
+        sliced.input_embeds = slice_token_tensor(self.input_embeds)
+        sliced.token_type_ids = slice_token_tensor(self.token_type_ids)
+        sliced.mm_input_embeds = slice_token_tensor(self.mm_input_embeds)
+        sliced.ngram_embedding_info = (
+            None
+            if self.ngram_embedding_info is None
+            else NgramEmbeddingInfo(
+                token_table=self.ngram_embedding_info.token_table,
+                column_starts=self.ngram_embedding_info.column_starts[
+                    req_index : req_index + 1
+                ],
+                req_lens=self.ngram_embedding_info.req_lens[
+                    req_index : req_index + 1
+                ],
+                out_column_starts=self.ngram_embedding_info.out_column_starts[
+                    req_index : req_index + 1
+                ],
+                out_req_lens=self.ngram_embedding_info.out_req_lens[
+                    req_index : req_index + 1
+                ],
+            )
+        )
+        sliced.dimensions = (
+            None if self.dimensions is None else [self.dimensions[req_index]]
+        )
+        sliced.rids = None if self.rids is None else [self.rids[req_index]]
+        return sliced
+
+    @classmethod
+    def concat_for_flowprefill(
+        cls, forward_batches: List["ForwardBatch"]
+    ) -> "ForwardBatch":
+        """Concatenate single-request split-prefill snapshots into one batch."""
+
+        assert forward_batches
+        if len(forward_batches) == 1:
+            return forward_batches[0]
+        assert all(batch.batch_size == 1 for batch in forward_batches)
+        assert all(
+            batch.split_index == forward_batches[0].split_index
+            for batch in forward_batches
+        )
+
+        base = copy.copy(forward_batches[0])
+
+        def cat_optional_batch_tensor(name: str) -> Optional[torch.Tensor]:
+            values = [getattr(batch, name) for batch in forward_batches]
+            if all(value is None for value in values):
+                return None
+            assert all(value is not None for value in values)
+            return torch.cat(values, dim=0)
+
+        def cat_optional_token_tensor(name: str) -> Optional[torch.Tensor]:
+            values = [getattr(batch, name) for batch in forward_batches]
+            if all(value is None for value in values):
+                return None
+            assert all(value is not None for value in values)
+            return torch.cat(values, dim=0)
+
+        def cat_optional_position_tensor(name: str) -> Optional[torch.Tensor]:
+            values = [getattr(batch, name) for batch in forward_batches]
+            if all(value is None for value in values):
+                return None
+            assert all(value is not None for value in values)
+            dim = 0 if values[0].dim() <= 1 else 1
+            return torch.cat(values, dim=dim)
+
+        base.batch_size = len(forward_batches)
+        base.input_ids = cat_optional_token_tensor("input_ids")
+        base.req_pool_indices = cat_optional_batch_tensor("req_pool_indices")
+        base.seq_lens = cat_optional_batch_tensor("seq_lens")
+        base.out_cache_loc = cat_optional_token_tensor("out_cache_loc")
+        base.seq_lens_sum = sum(batch.seq_lens_sum for batch in forward_batches)
+        base.orig_seq_lens = cat_optional_batch_tensor("orig_seq_lens")
+        base.out_cache_loc_swa = cat_optional_token_tensor("out_cache_loc_swa")
+        base.mamba_track_indices = cat_optional_batch_tensor("mamba_track_indices")
+        base.mamba_track_mask = cat_optional_batch_tensor("mamba_track_mask")
+        base.mamba_track_seqlens = cat_optional_batch_tensor("mamba_track_seqlens")
+        base.seq_lens_cpu = cat_optional_batch_tensor("seq_lens_cpu")
+        base.top_logprobs_nums = (
+            None
+            if any(batch.top_logprobs_nums is None for batch in forward_batches)
+            else sum((batch.top_logprobs_nums for batch in forward_batches), [])
+        )
+        base.token_ids_logprobs = (
+            None
+            if any(batch.token_ids_logprobs is None for batch in forward_batches)
+            else sum((batch.token_ids_logprobs for batch in forward_batches), [])
+        )
+        base.temperature = cat_optional_batch_tensor("temperature")
+        base.top_p = cat_optional_batch_tensor("top_p")
+        base.positions = cat_optional_position_tensor("positions")
+        base.extend_num_tokens = sum(
+            batch.extend_num_tokens or 0 for batch in forward_batches
+        )
+        base.extend_seq_lens = cat_optional_batch_tensor("extend_seq_lens")
+        base.extend_prefix_lens = cat_optional_batch_tensor("extend_prefix_lens")
+        if base.extend_seq_lens is not None:
+            starts = [0]
+            for batch in forward_batches[:-1]:
+                starts.append(starts[-1] + int(batch.extend_num_tokens or 0))
+            base.extend_start_loc = forward_batches[0].extend_start_loc.new_tensor(starts)
+        else:
+            base.extend_start_loc = None
+        base.extend_prefix_lens_cpu = (
+            None
+            if any(batch.extend_prefix_lens_cpu is None for batch in forward_batches)
+            else sum((batch.extend_prefix_lens_cpu for batch in forward_batches), [])
+        )
+        base.extend_seq_lens_cpu = (
+            None
+            if any(batch.extend_seq_lens_cpu is None for batch in forward_batches)
+            else sum((batch.extend_seq_lens_cpu for batch in forward_batches), [])
+        )
+        base.extend_logprob_start_lens_cpu = (
+            None
+            if any(
+                batch.extend_logprob_start_lens_cpu is None
+                for batch in forward_batches
+            )
+            else sum(
+                (batch.extend_logprob_start_lens_cpu for batch in forward_batches), []
+            )
+        )
+        base.extend_input_logprob_token_ids_gpu = cat_optional_token_tensor(
+            "extend_input_logprob_token_ids_gpu"
+        )
+        base.hidden_states = cat_optional_token_tensor("hidden_states")
+        base.residual = cat_optional_token_tensor("residual")
+        base.mm_inputs = (
+            None
+            if any(batch.mm_inputs is None for batch in forward_batches)
+            else sum((batch.mm_inputs for batch in forward_batches), [])
+        )
+        base.encoder_cached = (
+            None
+            if any(batch.encoder_cached is None for batch in forward_batches)
+            else sum((batch.encoder_cached for batch in forward_batches), [])
+        )
+        base.encoder_lens = cat_optional_batch_tensor("encoder_lens")
+        base.encoder_lens_cpu = (
+            None
+            if any(batch.encoder_lens_cpu is None for batch in forward_batches)
+            else sum((batch.encoder_lens_cpu for batch in forward_batches), [])
+        )
+        base.encoder_out_cache_loc = cat_optional_token_tensor("encoder_out_cache_loc")
+        base.lora_ids = (
+            None
+            if any(batch.lora_ids is None for batch in forward_batches)
+            else sum((batch.lora_ids for batch in forward_batches), [])
+        )
+        base.input_embeds = cat_optional_token_tensor("input_embeds")
+        base.token_type_ids = cat_optional_token_tensor("token_type_ids")
+        base.mm_input_embeds = cat_optional_token_tensor("mm_input_embeds")
+        if any(batch.ngram_embedding_info is None for batch in forward_batches):
+            base.ngram_embedding_info = None
+        else:
+            token_table = forward_batches[0].ngram_embedding_info.token_table
+            assert all(
+                batch.ngram_embedding_info.token_table is token_table
+                for batch in forward_batches
+            )
+            base.ngram_embedding_info = NgramEmbeddingInfo(
+                token_table=token_table,
+                column_starts=torch.cat(
+                    [
+                        batch.ngram_embedding_info.column_starts
+                        for batch in forward_batches
+                    ],
+                    dim=0,
+                ),
+                req_lens=torch.cat(
+                    [batch.ngram_embedding_info.req_lens for batch in forward_batches],
+                    dim=0,
+                ),
+                out_column_starts=torch.cat(
+                    [
+                        batch.ngram_embedding_info.out_column_starts
+                        for batch in forward_batches
+                    ],
+                    dim=0,
+                ),
+                out_req_lens=torch.cat(
+                    [
+                        batch.ngram_embedding_info.out_req_lens
+                        for batch in forward_batches
+                    ],
+                    dim=0,
+                ),
+            )
+        base.dimensions = (
+            None
+            if any(batch.dimensions is None for batch in forward_batches)
+            else sum((batch.dimensions for batch in forward_batches), [])
+        )
+        base.rids = (
+            None
+            if any(batch.rids is None for batch in forward_batches)
+            else sum((batch.rids for batch in forward_batches), [])
+        )
+        return base
 
     @classmethod
     def init_new(

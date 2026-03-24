@@ -50,6 +50,7 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
   ```bash
   python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --chunked-prefill-size 4096
   ```
+- To cooperatively preempt long prefills at layer boundaries in a single-engine deployment, see [FlowPrefill](../advanced_features/flowprefill.md).
 - To enable fp8 weight quantization, add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
 - To enable fp8 kv cache quantization, add `--kv-cache-dtype fp8_e4m3` or `--kv-cache-dtype fp8_e5m2`.
 - To enable deterministic inference and batch invariant operations, add `--enable-deterministic-inference`. More details can be found in [deterministic inference document](../advanced_features/deterministic_inference.md).
@@ -136,6 +137,11 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--abort-on-priority-when-disabled` | If set, abort requests that specify a priority when priority scheduling is disabled. | `False` | bool flag (set to enable) |
 | `--schedule-low-priority-values-first` | If specified with --enable-priority-scheduling, the scheduler will schedule requests with lower priority integer values first. | `False` | bool flag (set to enable) |
 | `--priority-scheduling-preemption-threshold` | Minimum difference in priorities for an incoming request to have to preempt running request(s). | `10` | Type: int |
+| `--enable-flowprefill` | Enable layer-level cooperative preemption for prefills using split-prefill execution. See [FlowPrefill](../advanced_features/flowprefill.md) for compatibility constraints and examples. | `False` | bool flag (set to enable) |
+| `--flowprefill-granularity` | Checkpoint granularity for FlowPrefill. Only `layer` is currently supported. | `layer` | `layer` |
+| `--flowprefill-split-layers` | Number of layers to execute in each split-prefill step when FlowPrefill is enabled. | `1` | Type: int |
+| `--flowprefill-max-preemptions` | Maximum number of cooperative preemptions allowed per request when FlowPrefill is enabled. `0` means unlimited. | `0` | Type: int |
+| `--flowprefill-priority-policy` | Ordering policy for FlowPrefill. `priority_fcfs` is the default. `deadline_fcfs` and `slack_edf` are also available as experimental policies; `slack_edf` uses a feasible-first S-EDF with heuristic TTFT prediction. | `priority_fcfs` | `priority_fcfs`, `deadline_fcfs`, `slack_edf` |
 | `--schedule-conservativeness` | How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently. | `1.0` | Type: float |
 | `--page-size` | The number of tokens in a page. | `1` | Type: int |
 | `--swa-full-tokens-ratio` | The ratio of SWA layer KV tokens / full layer KV tokens, regardless of the number of swa:full layers. It should be between 0 and 1. E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens. | `0.8` | Type: float |

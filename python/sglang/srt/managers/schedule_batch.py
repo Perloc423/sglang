@@ -216,6 +216,35 @@ class Modality(Enum):
         return [Modality.IMAGE, Modality.VIDEO, Modality.AUDIO]
 
 
+class PrefillState(Enum):
+    WAITING = auto()
+    RUNNING = auto()
+    PREEMPT_PENDING = auto()
+    PREEMPTED = auto()
+    FINISHED = auto()
+    ABORTED = auto()
+
+
+@dataclasses.dataclass
+class FlowPrefillExecCtx:
+    """Request-level resume state for FlowPrefill.
+
+    The current implementation still executes split-prefill through
+    `ScheduleBatch.split_*` fields, but request-level preemption work will move
+    the long-lived resume state onto `Req`. This context is the stable home for
+    that state.
+    """
+
+    split_index: int = 0
+    split_forward_batch: Optional[ForwardBatch] = None
+    seq_lens_cpu_cache: Optional[torch.Tensor] = None
+    split_attn_backend_needs_reinit: bool = False
+    prefill_stats: Optional["PrefillStats"] = None
+    resume_batch: Optional["ScheduleBatch"] = None
+    preempt_pending_since: Optional[float] = None
+    preempted_at: Optional[float] = None
+
+
 class MultimodalInputFormat(Enum):
     NORMAL = auto()
     PROCESSOR_OUTPUT = auto()
@@ -770,6 +799,7 @@ class Req(ReqDllmMixin):
         self.time_stats.set_metrics_collector(metrics_collector)
         self.time_stats.set_scheduler_recv_time()
         self.has_log_time_stats: bool = False
+        self.arrival_time = self.time_stats.scheduler_recv_time
 
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
@@ -795,6 +825,21 @@ class Req(ReqDllmMixin):
 
         # For Matryoshka embeddings
         self.dimensions = dimensions
+
+        # For FlowPrefill
+        self.prefill_state: PrefillState = PrefillState.WAITING
+        self.prefill_arrival_ts: float = self.arrival_time
+        self.prefill_deadline_ts: Optional[float] = None
+        self.prefill_slack: Optional[float] = None
+        self.prefill_predicted_remaining_time: Optional[float] = None
+        self.prefill_has_explicit_slack: bool = False
+        self.prefill_has_explicit_remaining_time: bool = False
+        self.prefill_observed_split_runtime: float = 0.0
+        self.prefill_observed_split_layers: int = 0
+        self.prefill_preempt_pending: bool = False
+        self.prefill_num_preemptions: int = 0
+        self.prefill_resume_split_index: int = 0
+        self.flowprefill_ctx = FlowPrefillExecCtx()
 
         # For diffusion LLM
         self.init_diffusion_llm(dllm_config)
@@ -1150,6 +1195,65 @@ class Req(ReqDllmMixin):
         if self.input_embeds is not None:
             self.output_ids = []
 
+        self.prefill_state = PrefillState.WAITING
+        self.prefill_preempt_pending = False
+        self.prefill_resume_split_index = 0
+        self.reset_flowprefill_ctx()
+
+    def reset_flowprefill_ctx(self):
+        self.flowprefill_ctx = FlowPrefillExecCtx()
+
+    def sync_flowprefill_ctx_from_batch(self, batch: "ScheduleBatch"):
+        self.prefill_resume_split_index = batch.split_index
+        self.flowprefill_ctx.split_index = batch.split_index
+        self.flowprefill_ctx.split_forward_batch = batch.split_forward_batch
+        self.flowprefill_ctx.seq_lens_cpu_cache = batch.seq_lens_cpu_cache
+        self.flowprefill_ctx.split_attn_backend_needs_reinit = (
+            batch.split_attn_backend_needs_reinit
+        )
+        self.flowprefill_ctx.prefill_stats = batch.prefill_stats
+        self.flowprefill_ctx.resume_batch = batch
+
+    def apply_flowprefill_ctx_to_batch(self, batch: "ScheduleBatch"):
+        batch.split_index = self.flowprefill_ctx.split_index
+        batch.split_forward_batch = self.flowprefill_ctx.split_forward_batch
+        batch.seq_lens_cpu_cache = self.flowprefill_ctx.seq_lens_cpu_cache
+        batch.split_attn_backend_needs_reinit = (
+            self.flowprefill_ctx.split_attn_backend_needs_reinit
+        )
+        batch.prefill_stats = self.flowprefill_ctx.prefill_stats
+
+    def sync_flowprefill_ctx_from_multi_req_batch(
+        self, batch: "ScheduleBatch", req_index: int
+    ) -> bool:
+        if batch.split_forward_batch is None:
+            return False
+
+        single_req_forward_batch = batch.split_forward_batch.slice_for_flowprefill_req(
+            req_index
+        )
+        if single_req_forward_batch is None:
+            return False
+
+        self.prefill_resume_split_index = batch.split_index
+        self.flowprefill_ctx.split_index = batch.split_index
+        self.flowprefill_ctx.split_forward_batch = single_req_forward_batch
+
+        seq_lens_cpu_cache = batch.seq_lens_cpu_cache
+        if seq_lens_cpu_cache is None:
+            seq_lens_cpu_cache = batch.split_forward_batch.seq_lens_cpu
+        self.flowprefill_ctx.seq_lens_cpu_cache = (
+            None
+            if seq_lens_cpu_cache is None
+            else seq_lens_cpu_cache[req_index : req_index + 1]
+        )
+        self.flowprefill_ctx.split_attn_backend_needs_reinit = (
+            batch.split_attn_backend_needs_reinit
+        )
+        self.flowprefill_ctx.prefill_stats = batch.prefill_stats
+        self.flowprefill_ctx.resume_batch = None
+        return True
+
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
@@ -1309,6 +1413,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     split_prefill_finished: bool = False
     split_forward_count: int = 1
     split_forward_batch: ForwardBatch = None
+    split_attn_backend_needs_reinit: bool = False
     seq_lens_cpu_cache: torch.Tensor = None
 
     # Stream
@@ -1385,6 +1490,131 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             chunked_req=chunked_req,
             dllm_config=dllm_config,
         )
+
+    @classmethod
+    def init_single_req_from_flowprefill_ctx(
+        cls,
+        req: Req,
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        tree_cache: BasePrefixCache,
+        model_config: ModelConfig,
+        enable_overlap: bool,
+        spec_algorithm: SpeculativeAlgorithm,
+        dllm_config: Optional[DllmConfig] = None,
+    ) -> "ScheduleBatch":
+        """Build a resumed split-prefill batch from request-owned FlowPrefill state.
+
+        This path intentionally avoids `prepare_for_extend()` so it can reuse the
+        existing split-prefill execution state without reallocating KV.
+        """
+
+        assert req.flowprefill_ctx.split_forward_batch is not None
+        forward_batch = req.flowprefill_ctx.split_forward_batch
+        assert forward_batch.batch_size == 1
+        seq_lens_cpu_cache = req.flowprefill_ctx.seq_lens_cpu_cache
+        if seq_lens_cpu_cache is None:
+            seq_lens_cpu_cache = forward_batch.seq_lens_cpu
+
+        is_hybrid_swa = isinstance(
+            token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+        )
+        extend_input_logprob_token_ids = None
+        if req.return_logprob:
+            global_start_idx, global_end_idx = (
+                len(req.prefix_indices),
+                len(req.fill_ids),
+            )
+            if req.logprob_start_len == -1:
+                logprob_start_len = len(req.origin_input_ids)
+            else:
+                logprob_start_len = req.logprob_start_len
+            if global_start_idx < logprob_start_len:
+                global_start_idx = logprob_start_len
+
+            logprob_token_ids = req.origin_input_ids[
+                global_start_idx + 1 : global_end_idx + 1
+            ]
+            extend_input_logprob_token_ids = list(logprob_token_ids)
+            extend_input_logprob_token_ids.extend(
+                [0]
+                * (
+                    req.extend_input_len
+                    - req.extend_logprob_start_len
+                    - len(logprob_token_ids)
+                )
+            )
+            extend_input_logprob_token_ids = torch.tensor(
+                extend_input_logprob_token_ids
+            )
+            extend_input_logprob_token_ids.clamp_(0, model_config.vocab_size - 1)
+
+        batch = cls(
+            reqs=[req],
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            tree_cache=tree_cache,
+            is_hybrid_swa=is_hybrid_swa,
+            model_config=model_config,
+            enable_overlap=enable_overlap,
+            return_logprob=req.return_logprob,
+            has_stream=req.stream,
+            has_grammar=req.grammar is not None,
+            device=req_to_token_pool.device,
+            spec_algorithm=spec_algorithm,
+            return_hidden_states=req.return_hidden_states,
+            return_routed_experts=req.return_routed_experts,
+            is_prefill_only=req.is_prefill_only,
+            dllm_config=dllm_config,
+            forward_mode=ForwardMode.SPLIT_PREFILL,
+            split_index=req.flowprefill_ctx.split_index,
+            split_forward_count=1,
+            split_forward_batch=forward_batch,
+            split_attn_backend_needs_reinit=(
+                req.flowprefill_ctx.split_attn_backend_needs_reinit
+            ),
+            seq_lens_cpu_cache=seq_lens_cpu_cache,
+            input_ids=forward_batch.input_ids,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            seq_lens_cpu=forward_batch.seq_lens_cpu,
+            orig_seq_lens=forward_batch.orig_seq_lens,
+            out_cache_loc=forward_batch.out_cache_loc,
+            seq_lens_sum=forward_batch.seq_lens_sum,
+            prefix_lens=[len(req.prefix_indices)],
+            extend_lens=[req.extend_input_len],
+            extend_logprob_start_lens=[req.extend_logprob_start_len],
+            extend_num_tokens=req.extend_input_len,
+            multimodal_inputs=[req.multimodal_inputs],
+            encoder_cached=None,
+            encoder_lens=None,
+            encoder_lens_cpu=None,
+            encoder_out_cache_loc=forward_batch.encoder_out_cache_loc,
+            input_embeds=forward_batch.input_embeds,
+            token_type_ids=forward_batch.token_type_ids,
+            dimensions=[req.dimensions] if req.dimensions is not None else None,
+            mamba_track_indices=forward_batch.mamba_track_indices,
+            mamba_track_mask=forward_batch.mamba_track_mask,
+            mamba_track_seqlens=forward_batch.mamba_track_seqlens,
+            prefill_stats=req.flowprefill_ctx.prefill_stats,
+            extend_input_logprob_token_ids=extend_input_logprob_token_ids,
+        )
+        batch.top_logprobs_nums = [req.top_logprobs_num] if req.return_logprob else None
+        batch.token_ids_logprobs = (
+            [req.token_ids_logprob] if req.return_logprob else None
+        )
+        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            batch,
+            model_config.vocab_size,
+        )
+        batch.prepare_for_split_prefill()
+        # Request-owned FlowPrefill resume reconstructs the runtime batch from a
+        # parked ForwardBatch snapshot. The attention backend keeps its own
+        # forward metadata outside ForwardBatch, so resumed batches must force a
+        # metadata rebuild before the next split-prefill step.
+        batch.split_attn_backend_needs_reinit = True
+        req.sync_flowprefill_ctx_from_batch(batch)
+        return batch
 
     def batch_size(self):
         return len(self.reqs)
@@ -1801,9 +2031,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_seqlens_cpu.append(mamba_track_seqlen)
 
     def prepare_for_split_prefill(self):
-        self.prepare_for_extend()
         # For split prefill, we need to set the forward mode to SPLIT_PREFILL
         self.forward_mode = ForwardMode.SPLIT_PREFILL
+        for req in self.reqs:
+            req.prefill_state = PrefillState.RUNNING
+            req.prefill_resume_split_index = self.split_index
+            req.flowprefill_ctx.split_index = self.split_index
+
+    def mark_flowprefill_preempt_pending(self):
+        for req in self.reqs:
+            req.prefill_preempt_pending = True
+            req.prefill_state = PrefillState.PREEMPT_PENDING
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED
@@ -2324,6 +2562,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            split_forward_batch=self.split_forward_batch,
         )
 
     def copy(self):
@@ -2518,3 +2757,6 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+
+    # For split prefill (FlowPrefill)
+    split_forward_batch: Optional[ForwardBatch] = None

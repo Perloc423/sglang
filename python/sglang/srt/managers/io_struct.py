@@ -202,6 +202,16 @@ class GenerateReqInput(BaseReq):
 
     # Priority for the request
     priority: Optional[int] = None
+    # Optional TTFT SLO in milliseconds for deriving a prefill deadline.
+    prefill_ttft_slo_ms: Optional[Union[List[Optional[float]], float]] = None
+    # Optional precomputed FlowPrefill deadline timestamp.
+    prefill_deadline_ts: Optional[Union[List[Optional[float]], float]] = None
+    # Optional precomputed FlowPrefill slack.
+    prefill_slack: Optional[Union[List[Optional[float]], float]] = None
+    # Optional estimated remaining prefill time in seconds.
+    prefill_predicted_remaining_time: Optional[
+        Union[List[Optional[float]], float]
+    ] = None
 
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
@@ -378,6 +388,7 @@ class GenerateReqInput(BaseReq):
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_bootstrap_params(num)
+        self._normalize_flowprefill_scheduling_params(num)
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -580,6 +591,27 @@ class GenerateReqInput(BaseReq):
         elif isinstance(self.bootstrap_pair_key, list):
             self.bootstrap_pair_key = self.bootstrap_pair_key * self.parallel_sample_num
 
+    def _normalize_flowprefill_scheduling_params(self, num):
+        """Normalize FlowPrefill scheduling metadata for batch processing."""
+
+        def normalize_param(param):
+            if param is None:
+                return [None] * num
+            if not isinstance(param, list):
+                return [param] * num
+            if self.parallel_sample_num > 1:
+                raise ValueError(
+                    "Cannot use list FlowPrefill scheduling metadata with parallel_sample_num > 1"
+                )
+            return param
+
+        self.prefill_ttft_slo_ms = normalize_param(self.prefill_ttft_slo_ms)
+        self.prefill_deadline_ts = normalize_param(self.prefill_deadline_ts)
+        self.prefill_slack = normalize_param(self.prefill_slack)
+        self.prefill_predicted_remaining_time = normalize_param(
+            self.prefill_predicted_remaining_time
+        )
+
     def _validate_session_params(self):
         """Validate that session parameters are properly formatted."""
         if self.session_params is not None:
@@ -644,6 +676,26 @@ class GenerateReqInput(BaseReq):
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             priority=self.priority,
+            prefill_ttft_slo_ms=(
+                self.prefill_ttft_slo_ms[i]
+                if isinstance(self.prefill_ttft_slo_ms, list)
+                else self.prefill_ttft_slo_ms
+            ),
+            prefill_deadline_ts=(
+                self.prefill_deadline_ts[i]
+                if isinstance(self.prefill_deadline_ts, list)
+                else self.prefill_deadline_ts
+            ),
+            prefill_slack=(
+                self.prefill_slack[i]
+                if isinstance(self.prefill_slack, list)
+                else self.prefill_slack
+            ),
+            prefill_predicted_remaining_time=(
+                self.prefill_predicted_remaining_time[i]
+                if isinstance(self.prefill_predicted_remaining_time, list)
+                else self.prefill_predicted_remaining_time
+            ),
             extra_key=self.extra_key,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
@@ -715,6 +767,10 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Priority for the request
     priority: Optional[int] = None
+    prefill_ttft_slo_ms: Optional[float] = None
+    prefill_deadline_ts: Optional[float] = None
+    prefill_slack: Optional[float] = None
+    prefill_predicted_remaining_time: Optional[float] = None
 
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None

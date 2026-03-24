@@ -155,7 +155,6 @@ class BaseTpWorker(ABC):
         return success, message
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-
         monkey_patch_torch_reductions()
         success, message = self.model_runner.update_weights_from_tensor(
             named_tensors=MultiprocessingSerializer.deserialize(
@@ -295,17 +294,17 @@ class TpModelWorker(BaseTpWorker):
         self.max_running_requests = self.model_runner.max_running_requests
         assert self.max_running_requests > 0, "max_running_request is zero"
         self.max_queued_requests = server_args.max_queued_requests
-        assert (
-            self.max_queued_requests is None or self.max_queued_requests >= 1
-        ), "If configured, max_queued_requests must be at least 1 for any work to be scheduled."
+        assert self.max_queued_requests is None or self.max_queued_requests >= 1, (
+            "If configured, max_queued_requests must be at least 1 for any work to be scheduled."
+        )
         self.max_req_len = min(
             self.model_config.context_len - 1,
             self.model_runner.max_token_pool_size - 1,
         )
         self.max_req_input_len = self.max_req_len - 5
-        assert (
-            self.max_req_len > 0 and self.max_req_input_len > 0
-        ), "Memory pool size is too small"
+        assert self.max_req_len > 0 and self.max_req_input_len > 0, (
+            "Memory pool size is too small"
+        )
 
         # Sync random seed across TP workers
         self.random_seed = broadcast_pyobj(
@@ -454,6 +453,7 @@ class TpModelWorker(BaseTpWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
         skip_attn_backend_init=False,
+        reinit_attn_backend: bool = False,
     ) -> GenerationBatchResult:
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
@@ -463,7 +463,22 @@ class TpModelWorker(BaseTpWorker):
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
 
-            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            # For split-prefill (FlowPrefill), reuse the existing forward batch to maintain
+            # state (hidden_states, split_index) across multiple forward passes.
+            if (
+                model_worker_batch.forward_mode.is_split_prefill()
+                and model_worker_batch.split_forward_batch is not None
+            ):
+                forward_batch = model_worker_batch.split_forward_batch
+            else:
+                forward_batch = ForwardBatch.init_new(
+                    model_worker_batch, self.model_runner
+                )
+                if model_worker_batch.forward_mode.is_split_prefill():
+                    # Persist the split-prefill execution state so the scheduler
+                    # can recover forward progress and resume from the next layer
+                    # chunk after each scheduler handoff or cooperative preemption.
+                    model_worker_batch.split_forward_batch = forward_batch
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
@@ -476,6 +491,7 @@ class TpModelWorker(BaseTpWorker):
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 skip_attn_backend_init=skip_attn_backend_init,
+                reinit_attn_backend=reinit_attn_backend,
             )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             batch_result = GenerationBatchResult(
@@ -505,9 +521,12 @@ class TpModelWorker(BaseTpWorker):
 
             if not model_worker_batch.is_prefill_only:
                 # For normal requests, sample the next token ids.
-                batch_result.next_token_ids = self.model_runner.sample(
-                    logits_output, forward_batch
-                )
+                # For split-prefill (FlowPrefill), logits_output is None until the last layer,
+                # so we skip sampling in intermediate steps.
+                if logits_output is not None:
+                    batch_result.next_token_ids = self.model_runner.sample(
+                        logits_output, forward_batch
+                    )
             else:
                 # For prefill-only requests, create dummy token IDs on CPU
                 # The size should match the batch size (number of sequences), not total tokens
@@ -518,6 +537,7 @@ class TpModelWorker(BaseTpWorker):
                 )
                 if (
                     model_worker_batch.return_logprob
+                    and logits_output is not None
                     and logits_output.next_token_logits is not None
                 ):
                     # NOTE: Compute logprobs without full sampling

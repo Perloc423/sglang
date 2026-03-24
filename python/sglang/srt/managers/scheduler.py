@@ -151,6 +151,7 @@ from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     ModelWorkerBatch,
     MultimodalInputs,
+    PrefillState,
     Req,
     ScheduleBatch,
 )
@@ -180,7 +181,11 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.req_time_stats import (
     real_time,
@@ -232,6 +237,12 @@ else:
     from torch.cuda import StreamContext as CudaStreamContext
 
 logger = logging.getLogger(__name__)
+
+FLOWPREFILL_HEURISTIC_DEBUG = get_bool_env_var(
+    "SGLANG_FLOWPREFILL_HEURISTIC_DEBUG"
+)
+FLOWPREFILL_PROMPT_LEN_BUCKET_UPPER_BOUNDS = (512, 2048)
+FLOWPREFILL_REQUEST_LOCAL_PREDICTOR_MIN_LAYERS = 8
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
@@ -405,6 +416,12 @@ class Scheduler(
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
+        if (
+            self.enable_flowprefill
+            and self.disaggregation_mode != DisaggregationMode.NULL
+        ):
+            logger.warning("FlowPrefill disabled: disaggregation mode is enabled")
+            self.enable_flowprefill = False
 
         # Init overlap schedule
         self.init_overlap()
@@ -722,7 +739,6 @@ class Scheduler(
 
                 self.tree_cache = SWAChunkCache(params)
         else:
-
             if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
                 # lazy import to avoid JIT overhead
                 from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
@@ -797,6 +813,18 @@ class Scheduler(
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
+        self.preempted_prefill_queue: Deque[Req] = deque()
+        self.running_split_prefill_batch: Optional[ScheduleBatch] = None
+        self.flowprefill_observed_split_runtime: float = 0.0
+        self.flowprefill_observed_split_layers: int = 0
+        self.flowprefill_observed_split_runtime_by_bucket: Dict[int, float] = {
+            bucket: 0.0
+            for bucket in range(len(FLOWPREFILL_PROMPT_LEN_BUCKET_UPPER_BOUNDS) + 1)
+        }
+        self.flowprefill_observed_split_layers_by_bucket: Dict[int, int] = {
+            bucket: 0
+            for bucket in range(len(FLOWPREFILL_PROMPT_LEN_BUCKET_UPPER_BOUNDS) + 1)
+        }
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
@@ -870,6 +898,7 @@ class Scheduler(
             self.enable_priority_scheduling
             and not self.server_args.disable_priority_preemption
         )
+        self.enable_flowprefill = self._is_flowprefill_enabled()
 
         self.init_new_token_ratio = min(
             envs.SGLANG_INIT_NEW_TOKEN_RATIO.get()
@@ -884,6 +913,51 @@ class Scheduler(
             self.init_new_token_ratio - self.min_new_token_ratio
         ) / envs.SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS.get()
         self.new_token_ratio = self.init_new_token_ratio
+
+    def _is_flowprefill_enabled(self) -> bool:
+        if not self.server_args.enable_flowprefill:
+            return False
+
+        incompatible_reasons = []
+        if self.server_args.flowprefill_granularity != "layer":
+            incompatible_reasons.append("only layer granularity is supported")
+        if self.server_args.enable_pdmux:
+            incompatible_reasons.append("pdmux is enabled")
+        if self.enable_overlap:
+            incompatible_reasons.append("overlap scheduling is enabled")
+        if not self.spec_algorithm.is_none():
+            incompatible_reasons.append("speculative decoding is enabled")
+        if self.pp_size > 1:
+            incompatible_reasons.append("pp_size > 1")
+        if self.tp_size > 1:
+            incompatible_reasons.append("tp_size > 1")
+        if self.server_args.enable_dp_attention:
+            incompatible_reasons.append("dp attention is enabled")
+        if (
+            getattr(self, "disaggregation_mode", DisaggregationMode.NULL)
+            != DisaggregationMode.NULL
+        ):
+            incompatible_reasons.append("disaggregation mode is enabled")
+        if self.chunked_prefill_size is not None and self.chunked_prefill_size > 0:
+            incompatible_reasons.append("chunked prefill is enabled")
+        if not callable(
+            getattr(self.tp_worker.model_runner.model, "forward_split_prefill", None)
+        ):
+            incompatible_reasons.append(
+                "model does not implement forward_split_prefill"
+            )
+
+        if incompatible_reasons:
+            logger.warning("FlowPrefill disabled: %s", ", ".join(incompatible_reasons))
+            return False
+
+        logger.info(
+            "FlowPrefill enabled (granularity=%s, split_layers=%d, max_preemptions=%d)",
+            self.server_args.flowprefill_granularity,
+            self.server_args.flowprefill_split_layers,
+            self.server_args.flowprefill_max_preemptions,
+        )
+        return True
 
     def init_soft_watchdog(self, server_args: ServerArgs):
         if (x := server_args.soft_watchdog_timeout) is not None:
@@ -1472,7 +1546,6 @@ class Scheduler(
         ):
             recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
             for req, error_msg, error_code in abort_reqs:
-
                 status_code = (
                     HTTPStatus.BAD_REQUEST
                     if error_code == 400
@@ -1617,6 +1690,264 @@ class Scheduler(
         else:
             return MultimodalInputs.from_dict(mm_inputs_dict)
 
+    def _maybe_compute_mrope_positions(self, req) -> None:
+        """Compute M-RoPE positions when they are missing (e.g. gRPC preprocessed path)."""
+        if self._mm_processor is None:
+            return
+        mm = req.multimodal_inputs
+        if mm is None or mm.mrope_positions is not None:
+            return
+
+        mrope_positions, mrope_position_delta = (
+            self._mm_processor.compute_mrope_positions(
+                req.origin_input_ids, mm.mm_items
+            )
+        )
+        if mrope_positions is not None:
+            mm.mrope_positions = mrope_positions
+            mm.mrope_position_delta = mrope_position_delta
+
+    def _initialize_flowprefill_scheduling_fields(self, req: Req, recv_req) -> None:
+        req.prefill_arrival_ts = req.arrival_time
+        req.prefill_predicted_remaining_time = getattr(
+            recv_req, "prefill_predicted_remaining_time", None
+        )
+        req.prefill_deadline_ts = getattr(recv_req, "prefill_deadline_ts", None)
+        req.prefill_slack = getattr(recv_req, "prefill_slack", None)
+        req.prefill_has_explicit_remaining_time = (
+            req.prefill_predicted_remaining_time is not None
+        )
+        req.prefill_has_explicit_slack = req.prefill_slack is not None
+
+        prefill_ttft_slo_ms = getattr(recv_req, "prefill_ttft_slo_ms", None)
+        if prefill_ttft_slo_ms is None and req.prefill_deadline_ts is None:
+            prefill_ttft_slo_ms = getattr(
+                self.server_args, "flowprefill_default_ttft_slo_ms", None
+            )
+        if req.prefill_deadline_ts is None and prefill_ttft_slo_ms is not None:
+            req.prefill_deadline_ts = (
+                req.prefill_arrival_ts + float(prefill_ttft_slo_ms) / 1000.0
+            )
+
+        self._refresh_flowprefill_predicted_remaining_time(req)
+        self._refresh_flowprefill_slack(req, now=req.prefill_arrival_ts)
+
+    def _get_flowprefill_remaining_layers(
+        self, req: Req, split_index: Optional[int] = None
+    ) -> int:
+        if split_index is None:
+            split_index = req.flowprefill_ctx.split_index
+        return max(self.model_config.num_hidden_layers - int(split_index), 0)
+
+    def _get_flowprefill_prompt_len(self, req: Req) -> int:
+        input_ids = (
+            getattr(req, "origin_input_ids_unpadded", None) or req.origin_input_ids
+        )
+        return len(input_ids)
+
+    def _get_flowprefill_prompt_len_bucket(self, req: Req) -> int:
+        prompt_len = self._get_flowprefill_prompt_len(req)
+        for bucket, upper_bound in enumerate(FLOWPREFILL_PROMPT_LEN_BUCKET_UPPER_BOUNDS):
+            if prompt_len <= upper_bound:
+                return bucket
+        return len(FLOWPREFILL_PROMPT_LEN_BUCKET_UPPER_BOUNDS)
+
+    def _get_flowprefill_bucket_average_layer_latency_seconds(
+        self, req: Req
+    ) -> Optional[float]:
+        bucket = self._get_flowprefill_prompt_len_bucket(req)
+        observed_layers = getattr(
+            self, "flowprefill_observed_split_layers_by_bucket", {}
+        ).get(bucket, 0)
+        if observed_layers <= 0:
+            return None
+        observed_runtime = getattr(
+            self, "flowprefill_observed_split_runtime_by_bucket", {}
+        ).get(bucket, 0.0)
+        return observed_runtime / observed_layers
+
+    def _get_flowprefill_average_layer_latency_seconds(
+        self, req: Req
+    ) -> Optional[float]:
+        if (
+            req.prefill_observed_split_layers
+            >= FLOWPREFILL_REQUEST_LOCAL_PREDICTOR_MIN_LAYERS
+        ):
+            return (
+                req.prefill_observed_split_runtime / req.prefill_observed_split_layers
+            )
+
+        bucket_avg_layer_latency = (
+            self._get_flowprefill_bucket_average_layer_latency_seconds(req)
+        )
+        if bucket_avg_layer_latency is not None:
+            return bucket_avg_layer_latency
+
+        scheduler_observed_layers = getattr(
+            self, "flowprefill_observed_split_layers", 0
+        )
+        if scheduler_observed_layers > 0:
+            return (
+                getattr(self, "flowprefill_observed_split_runtime", 0.0)
+                / scheduler_observed_layers
+            )
+        return None
+
+    def _estimate_flowprefill_remaining_time(
+        self, req: Req, split_index: Optional[int] = None
+    ) -> Optional[float]:
+        avg_layer_latency = self._get_flowprefill_average_layer_latency_seconds(req)
+        if avg_layer_latency is None:
+            return None
+        remaining_layers = self._get_flowprefill_remaining_layers(req, split_index)
+        return remaining_layers * avg_layer_latency
+
+    def _refresh_flowprefill_predicted_remaining_time(
+        self, req: Req, split_index: Optional[int] = None
+    ) -> None:
+        if req.prefill_has_explicit_remaining_time:
+            return
+        req.prefill_predicted_remaining_time = self._estimate_flowprefill_remaining_time(
+            req, split_index=split_index
+        )
+
+    def _get_flowprefill_effective_slack(
+        self, req: Req, now: Optional[float] = None
+    ) -> Optional[float]:
+        if req.prefill_has_explicit_slack:
+            return req.prefill_slack
+        if req.prefill_deadline_ts is None:
+            return None
+        predicted_remaining_time = req.prefill_predicted_remaining_time
+        if predicted_remaining_time is None:
+            predicted_remaining_time = self._estimate_flowprefill_remaining_time(req)
+            if predicted_remaining_time is None:
+                return None
+        if now is None:
+            now = time.perf_counter()
+        return req.prefill_deadline_ts - now - predicted_remaining_time
+
+    def _get_flowprefill_effective_slack_with_remaining_time(
+        self,
+        req: Req,
+        *,
+        predicted_remaining_time: Optional[float],
+        now: float,
+    ) -> Optional[float]:
+        if req.prefill_has_explicit_slack:
+            return req.prefill_slack
+        if req.prefill_deadline_ts is None or predicted_remaining_time is None:
+            return None
+        return req.prefill_deadline_ts - now - predicted_remaining_time
+
+    def _log_flowprefill_slack_edf_priority(
+        self,
+        req: Req,
+        *,
+        now: float,
+        key: Tuple[float, ...],
+        context: str,
+    ) -> None:
+        if (
+            not FLOWPREFILL_HEURISTIC_DEBUG
+            or self.server_args.flowprefill_priority_policy != "slack_edf"
+        ):
+            return
+        slack = self._get_flowprefill_effective_slack(req, now=now)
+        deadline = (
+            req.prefill_deadline_ts
+            if req.prefill_deadline_ts is not None
+            else float("inf")
+        )
+        logger.info(
+            "FlowPrefill heuristic debug: "
+            "(context=%s, rid=%s, split_index=%d, prompt_len=%d, bucket=%d, "
+            "priority=%s, deadline=%s, predicted_remaining=%s, slack=%s, key=%s, "
+            "observed_runtime=%s, observed_layers=%s, preemptions=%d)",
+            context,
+            req.rid,
+            req.flowprefill_ctx.split_index,
+            self._get_flowprefill_prompt_len(req),
+            self._get_flowprefill_prompt_len_bucket(req),
+            req.priority,
+            (
+                f"{deadline:.6f}"
+                if deadline != float("inf")
+                else "inf"
+            ),
+            (
+                f"{req.prefill_predicted_remaining_time:.6f}"
+                if req.prefill_predicted_remaining_time is not None
+                else "None"
+            ),
+            (
+                f"{slack:.6f}"
+                if slack is not None and slack != float("inf")
+                else "inf"
+            ),
+            key,
+            f"{req.prefill_observed_split_runtime:.6f}",
+            req.prefill_observed_split_layers,
+            req.prefill_num_preemptions,
+        )
+
+    def _refresh_flowprefill_slack(
+        self, req: Req, now: Optional[float] = None
+    ) -> None:
+        if req.prefill_has_explicit_slack:
+            return
+        req.prefill_slack = self._get_flowprefill_effective_slack(req, now=now)
+
+    def _get_flowprefill_batch_runtime_seconds(
+        self, batch: ScheduleBatch
+    ) -> Optional[float]:
+        if not batch.reqs:
+            return None
+        time_stats = getattr(batch.reqs[0], "time_stats", None)
+        if time_stats is None:
+            return None
+        start_time = getattr(time_stats, "prefill_run_batch_start_time", 0.0)
+        end_time = getattr(time_stats, "prefill_run_batch_end_time", 0.0)
+        if start_time <= 0.0 or end_time < start_time:
+            return None
+        return end_time - start_time
+
+    def _observe_flowprefill_split_execution(
+        self, batch: ScheduleBatch, previous_split_index: int
+    ) -> None:
+        delta_layers = batch.split_index - previous_split_index
+        if delta_layers <= 0:
+            return
+
+        batch_runtime_seconds = self._get_flowprefill_batch_runtime_seconds(batch)
+        if batch_runtime_seconds is None:
+            return
+
+        self.flowprefill_observed_split_runtime = (
+            getattr(self, "flowprefill_observed_split_runtime", 0.0)
+            + batch_runtime_seconds
+        )
+        self.flowprefill_observed_split_layers = (
+            getattr(self, "flowprefill_observed_split_layers", 0) + delta_layers
+        )
+
+        for req in batch.reqs:
+            req.prefill_observed_split_runtime += batch_runtime_seconds
+            req.prefill_observed_split_layers += delta_layers
+            bucket = self._get_flowprefill_prompt_len_bucket(req)
+            self.flowprefill_observed_split_runtime_by_bucket[bucket] = (
+                self.flowprefill_observed_split_runtime_by_bucket.get(bucket, 0.0)
+                + batch_runtime_seconds
+            )
+            self.flowprefill_observed_split_layers_by_bucket[bucket] = (
+                self.flowprefill_observed_split_layers_by_bucket.get(bucket, 0)
+                + delta_layers
+            )
+            self._refresh_flowprefill_predicted_remaining_time(
+                req, split_index=batch.split_index
+            )
+            self._refresh_flowprefill_slack(req)
+
     def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
         for req in batch.reqs:
             if not req.finished() or not (mm_inputs := req.multimodal_inputs):
@@ -1683,6 +2014,7 @@ class Scheduler(
                 time_stats=recv_req.time_stats,
             )
             req.tokenizer = self.tokenizer
+            self._initialize_flowprefill_scheduling_fields(req, recv_req)
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -1837,6 +2169,706 @@ class Scheduler(
                     prefix_keys,
                 )
 
+    def _flowprefill_priority_key_priority_fcfs(self, req: Req) -> Tuple[float, float]:
+        priority = (
+            req.priority
+            if req.priority is not None
+            else self.server_args.default_priority_value
+        )
+        if priority is None:
+            priority = (
+                sys.maxsize
+                if self.schedule_low_priority_values_first
+                else -sys.maxsize - 1
+            )
+        priority_sign = 1 if self.schedule_low_priority_values_first else -1
+        time_key = req.time_stats.wait_queue_entry_time
+        return (
+            priority * priority_sign,
+            time_key,
+        )
+
+    def _flowprefill_priority_key_deadline_fcfs(self, req: Req) -> Tuple[float, float]:
+        deadline = (
+            req.prefill_deadline_ts
+            if req.prefill_deadline_ts is not None
+            else float("inf")
+        )
+        return (deadline, req.time_stats.wait_queue_entry_time)
+
+    def _flowprefill_priority_key_slack_edf(
+        self,
+        req: Req,
+        *,
+        now: Optional[float] = None,
+        predicted_remaining_time: Optional[float] = None,
+        context: str = "priority_key",
+    ) -> Tuple[int, float, float, float]:
+        if now is None:
+            now = time.perf_counter()
+        if predicted_remaining_time is None:
+            slack = self._get_flowprefill_effective_slack(req, now=now)
+        else:
+            slack = self._get_flowprefill_effective_slack_with_remaining_time(
+                req,
+                predicted_remaining_time=predicted_remaining_time,
+                now=now,
+            )
+        infeasible = slack is None or slack < 0.0
+        deadline = (
+            req.prefill_deadline_ts
+            if req.prefill_deadline_ts is not None
+            else float("inf")
+        )
+        if infeasible:
+            # Paper-style S-EDF: infeasible requests are globally deprioritized.
+            key = (1, deadline, req.time_stats.wait_queue_entry_time, float("inf"))
+            self._log_flowprefill_slack_edf_priority(
+                req, now=now, key=key, context=context
+            )
+            return key
+        key = (0, slack, deadline, req.time_stats.wait_queue_entry_time)
+        self._log_flowprefill_slack_edf_priority(
+            req, now=now, key=key, context=context
+        )
+        return key
+
+    def _flowprefill_priority_key(self, req: Req) -> Tuple[float, ...]:
+        policy = self.server_args.flowprefill_priority_policy
+        if policy == "priority_fcfs":
+            return self._flowprefill_priority_key_priority_fcfs(req)
+        if policy == "deadline_fcfs":
+            return self._flowprefill_priority_key_deadline_fcfs(req)
+        if policy == "slack_edf":
+            return self._flowprefill_priority_key_slack_edf(req)
+        raise ValueError(f"Unsupported FlowPrefill priority policy: {policy}")
+
+    def _flowprefill_batch_request_priority_key(
+        self, batch: ScheduleBatch
+    ) -> Tuple[float, ...]:
+        best_req = min(batch.reqs, key=self._flowprefill_priority_key)
+        return self._flowprefill_priority_key(best_req)
+
+    def _flowprefill_batch_priority_key(
+        self, batch: ScheduleBatch
+    ) -> Tuple[float, ...]:
+        return (*self._flowprefill_batch_request_priority_key(batch), batch.split_index)
+
+    def _flowprefill_preempted_req_priority_key(
+        self, req: Req
+    ) -> Tuple[int, float, int]:
+        return (
+            *self._flowprefill_priority_key(req),
+            req.flowprefill_ctx.split_index,
+        )
+
+    def _get_flowprefill_waiting_candidate(
+        self,
+    ) -> Tuple[Optional[List[Req]], Optional[Tuple[float, ...]]]:
+        if not self.waiting_queue:
+            return None, None
+
+        if self.server_args.flowprefill_priority_policy != "slack_edf":
+            seed_req = self.waiting_queue[0]
+            return [seed_req], (*self._flowprefill_priority_key(seed_req), -1)
+
+        now = time.perf_counter()
+        feasible_waiting_reqs = [
+            req
+            for req in self.waiting_queue
+            if self._flowprefill_priority_key_slack_edf(
+                req, now=now, context="waiting_candidate_seed"
+            )[0]
+            == 0
+        ]
+        if feasible_waiting_reqs:
+            min_bucket = min(
+                self._get_flowprefill_prompt_len_bucket(req)
+                for req in feasible_waiting_reqs
+            )
+            seed_candidates = [
+                req
+                for req in feasible_waiting_reqs
+                if self._get_flowprefill_prompt_len_bucket(req) == min_bucket
+            ]
+            seed_req = min(
+                seed_candidates,
+                key=lambda req: self._flowprefill_priority_key_slack_edf(
+                    req, now=now, context="waiting_candidate_seed"
+                ),
+            )
+        else:
+            seed_req = self.waiting_queue[0]
+
+        seed_deadline = seed_req.prefill_deadline_ts
+        seed_remaining = (
+            seed_req.prefill_predicted_remaining_time
+            if seed_req.prefill_predicted_remaining_time is not None
+            else self._estimate_flowprefill_remaining_time(seed_req)
+        )
+        seed_key = self._flowprefill_priority_key_slack_edf(
+            seed_req, now=now, context="waiting_candidate_seed"
+        )
+        if seed_deadline is None or seed_remaining is None or seed_key[0] != 0:
+            return [seed_req], (*seed_key, -1)
+
+        seed_bucket = self._get_flowprefill_prompt_len_bucket(seed_req)
+        candidate_reqs = [seed_req]
+        candidate_rids = {seed_req.rid}
+        candidate_remaining = seed_remaining
+
+        for req in self.waiting_queue:
+            if req.rid in candidate_rids:
+                continue
+            if self._get_flowprefill_prompt_len_bucket(req) != seed_bucket:
+                continue
+
+            req_key = self._flowprefill_priority_key_slack_edf(
+                req, now=now, context="waiting_candidate_member"
+            )
+            if req_key[0] != 0:
+                continue
+
+            req_remaining = (
+                req.prefill_predicted_remaining_time
+                if req.prefill_predicted_remaining_time is not None
+                else self._estimate_flowprefill_remaining_time(req)
+            )
+            if req_remaining is None:
+                continue
+
+            proposed_remaining = max(candidate_remaining, req_remaining)
+            proposed_seed_key = self._flowprefill_priority_key_slack_edf(
+                seed_req,
+                now=now,
+                predicted_remaining_time=proposed_remaining,
+                context="waiting_candidate_seed_projected",
+            )
+            if proposed_seed_key[0] != 0:
+                continue
+
+            candidate_reqs.append(req)
+            candidate_rids.add(req.rid)
+            candidate_remaining = proposed_remaining
+            seed_key = proposed_seed_key
+
+        waiting_harm = self._get_flowprefill_candidate_harm(
+            candidate_reqs,
+            candidate_service_time=candidate_remaining,
+        )
+        return candidate_reqs, (seed_key[0], waiting_harm, *seed_key[1:], -len(candidate_reqs))
+
+    def _get_flowprefill_preempted_candidate_size(self, req: Req) -> int:
+        resume_batch = self._get_flowprefill_resume_batch_for_req(req)
+        if resume_batch is not None and getattr(resume_batch, "reqs", None):
+            return len(resume_batch.reqs)
+        if self._can_resume_flowprefill_req_as_single_batch(req):
+            regroupable = self._get_flowprefill_regroupable_reqs(req)
+            if regroupable:
+                return len(regroupable)
+        return 1
+
+    def _get_flowprefill_preempted_candidate_reqs(self, req: Req) -> List[Req]:
+        resume_batch = self._get_flowprefill_resume_batch_for_req(req)
+        if resume_batch is not None and getattr(resume_batch, "reqs", None):
+            return list(resume_batch.reqs)
+        if self._can_resume_flowprefill_req_as_single_batch(req):
+            regroupable = self._get_flowprefill_regroupable_reqs(req)
+            if regroupable:
+                return regroupable
+        return [req]
+
+    def _get_flowprefill_candidate_service_time(
+        self, candidate_reqs: List[Req]
+    ) -> Optional[float]:
+        candidate_service_time = None
+        for req in candidate_reqs:
+            req_remaining = (
+                req.prefill_predicted_remaining_time
+                if req.prefill_predicted_remaining_time is not None
+                else self._estimate_flowprefill_remaining_time(req)
+            )
+            if req_remaining is None:
+                continue
+            if candidate_service_time is None:
+                candidate_service_time = req_remaining
+            else:
+                candidate_service_time = max(candidate_service_time, req_remaining)
+        return candidate_service_time
+
+    def _get_flowprefill_candidate_harm(
+        self, candidate_reqs: List[Req], candidate_service_time: Optional[float]
+    ) -> int:
+        if (
+            self.server_args.flowprefill_priority_policy != "slack_edf"
+            or candidate_service_time is None
+            or candidate_service_time <= 0.0
+        ):
+            return 0
+
+        candidate_rids = {req.rid for req in candidate_reqs}
+        now = time.perf_counter()
+        harm = 0
+        for req in self.waiting_queue:
+            if req.rid in candidate_rids:
+                continue
+            slack = self._get_flowprefill_effective_slack(req, now=now)
+            if slack is None or slack < 0.0:
+                continue
+            if slack - candidate_service_time < 0.0:
+                harm += 1
+        return harm
+
+    def _get_flowprefill_candidate_priority_key(
+        self, candidate_reqs: List[Req], *, now: Optional[float] = None
+    ) -> Tuple[float, ...]:
+        if not candidate_reqs:
+            return (float("inf"),)
+        if self.server_args.flowprefill_priority_policy != "slack_edf":
+            seed_req = min(candidate_reqs, key=self._flowprefill_priority_key)
+            return (*self._flowprefill_priority_key(seed_req), -len(candidate_reqs))
+
+        if now is None:
+            now = time.perf_counter()
+        seed_req = min(
+            candidate_reqs,
+            key=lambda req: self._flowprefill_priority_key_slack_edf(
+                req, now=now, context="candidate_priority"
+            ),
+        )
+        seed_key = self._flowprefill_priority_key_slack_edf(
+            seed_req, now=now, context="candidate_priority"
+        )
+        candidate_service_time = self._get_flowprefill_candidate_service_time(
+            candidate_reqs
+        )
+        candidate_harm = self._get_flowprefill_candidate_harm(
+            candidate_reqs, candidate_service_time
+        )
+        return (seed_key[0], candidate_harm, *seed_key[1:], -len(candidate_reqs))
+
+    def _clear_flowprefill_waiting_candidate_selection(self) -> None:
+        self._flowprefill_selected_waiting_candidate_rids = None
+        self._flowprefill_selected_waiting_candidate_size = None
+
+    def _set_flowprefill_waiting_candidate_selection(
+        self, candidate_reqs: List[Req]
+    ) -> None:
+        candidate_rids = [req.rid for req in candidate_reqs]
+        candidate_rid_set = set(candidate_rids)
+        candidate_by_rid = {req.rid: req for req in candidate_reqs}
+        reordered = [candidate_by_rid[rid] for rid in candidate_rids]
+        reordered.extend(
+            req for req in self.waiting_queue if req.rid not in candidate_rid_set
+        )
+        self.waiting_queue = reordered
+        self._flowprefill_selected_waiting_candidate_rids = candidate_rids
+        self._flowprefill_selected_waiting_candidate_size = len(candidate_rids)
+
+    def _reorder_flowprefill_waiting_queue_for_selected_candidate(self) -> None:
+        candidate_rids = getattr(
+            self, "_flowprefill_selected_waiting_candidate_rids", None
+        )
+        if not candidate_rids:
+            return
+        selected_set = set(candidate_rids)
+        req_by_rid = {req.rid: req for req in self.waiting_queue}
+        reordered = [req_by_rid[rid] for rid in candidate_rids if rid in req_by_rid]
+        reordered.extend(
+            req for req in self.waiting_queue if req.rid not in selected_set
+        )
+        self.waiting_queue = reordered
+
+    def _flowprefill_request_should_preempt(self, req: Req) -> bool:
+        if not self.enable_flowprefill or self.running_split_prefill_batch is None:
+            return False
+        if req.finished():
+            return False
+        batch = self.running_split_prefill_batch
+        if any(r.prefill_preempt_pending for r in batch.reqs):
+            return False
+        if self.server_args.flowprefill_max_preemptions > 0 and any(
+            r.prefill_num_preemptions >= self.server_args.flowprefill_max_preemptions
+            for r in batch.reqs
+        ):
+            return False
+        incoming_key = self._flowprefill_priority_key(req)
+        running_key = self._flowprefill_batch_request_priority_key(batch)
+        should_preempt = incoming_key < running_key
+        if (
+            FLOWPREFILL_HEURISTIC_DEBUG
+            and self.server_args.flowprefill_priority_policy == "slack_edf"
+        ):
+            logger.info(
+                "FlowPrefill heuristic debug: "
+                "(context=preempt_decision, incoming_rid=%s, incoming_key=%s, "
+                "running_rids=%s, running_key=%s, should_preempt=%s)",
+                req.rid,
+                incoming_key,
+                [r.rid for r in batch.reqs],
+                running_key,
+                should_preempt,
+            )
+        return should_preempt
+
+    def _flowprefill_queue_length(self) -> int:
+        return len(self.preempted_prefill_queue) if self.enable_flowprefill else 0
+
+    def _update_flowprefill_queue_stats(self) -> None:
+        if hasattr(self, "stats"):
+            self.stats.num_preempted_prefill_queue_reqs = (
+                self._flowprefill_queue_length()
+            )
+
+    def _record_flowprefill_resume_fallback(self, reason: str) -> None:
+        if getattr(self, "current_scheduler_metrics_enabled", False):
+            self.metrics_collector.increment_flowprefill_resume_fallback(reason)
+
+    def _record_flowprefill_preempted_batch(self, batch: ScheduleBatch) -> None:
+        self._update_flowprefill_queue_stats()
+        if getattr(self, "current_scheduler_metrics_enabled", False):
+            self.metrics_collector.increment_flowprefill_preempted_requests(
+                len(batch.reqs)
+            )
+
+    def _record_flowprefill_resume(
+        self,
+        reqs: List[Req],
+        *,
+        resume_mode: str,
+        split_index: int,
+    ) -> Optional[float]:
+        parked_latencies = []
+        now = time.perf_counter()
+        for req in reqs:
+            parked_at = req.flowprefill_ctx.preempted_at
+            if parked_at is not None:
+                parked_latencies.append(max(0.0, now - parked_at))
+            req.flowprefill_ctx.preempted_at = None
+            req.flowprefill_ctx.preempt_pending_since = None
+
+        parked_duration_seconds = max(parked_latencies) if parked_latencies else None
+        self._update_flowprefill_queue_stats()
+        if getattr(self, "current_scheduler_metrics_enabled", False):
+            self.metrics_collector.increment_flowprefill_resumed_requests(
+                len(reqs), resume_mode
+            )
+            self.metrics_collector.observe_flowprefill_resume(
+                resume_mode=resume_mode,
+                split_index=split_index,
+                parked_duration_seconds=parked_duration_seconds,
+            )
+        return parked_duration_seconds
+
+    def _set_running_split_prefill_batch(
+        self, batch: ScheduleBatch, *, resume_mode: str
+    ) -> None:
+        self.running_split_prefill_batch = batch
+        logger.info(
+            "FlowPrefill: starting split-prefill batch "
+            "(rids=%s, split_index=%d, resume_mode=%s)",
+            [r.rid for r in batch.reqs],
+            batch.split_index,
+            resume_mode,
+        )
+
+    def _maybe_mark_flowprefill_preempt_pending(self, req: Req) -> None:
+        if self._flowprefill_request_should_preempt(req):
+            batch = self.running_split_prefill_batch
+            now = time.perf_counter()
+            for running_req in batch.reqs:
+                running_req.flowprefill_ctx.preempt_pending_since = now
+            logger.info(
+                "FlowPrefill: marking preempt-pending on batch "
+                "(rids=%s, split_index=%d, trigger_rid=%s, trigger_priority=%s, queue_len=%d)",
+                [r.rid for r in batch.reqs],
+                batch.split_index,
+                req.rid,
+                req.priority,
+                self._flowprefill_queue_length(),
+            )
+            batch.mark_flowprefill_preempt_pending()
+
+    def _enqueue_preempted_flowprefill_batch(self, batch: ScheduleBatch) -> None:
+        now = time.perf_counter()
+        for req_index, req in enumerate(batch.reqs):
+            captured_request_owned_state = False
+            if len(batch.reqs) == 1:
+                req.sync_flowprefill_ctx_from_batch(batch)
+                req.flowprefill_ctx.resume_batch = None
+                captured_request_owned_state = True
+            else:
+                captured_request_owned_state = req.sync_flowprefill_ctx_from_multi_req_batch(
+                    batch, req_index
+                )
+                if not captured_request_owned_state:
+                    req.sync_flowprefill_ctx_from_batch(batch)
+            req.flowprefill_ctx.preempted_at = now
+        self._clear_flowprefill_batch_runtime_state(batch)
+        batch.batch_is_full = False
+        for req in batch.reqs:
+            req.prefill_preempt_pending = False
+            req.prefill_num_preemptions += 1
+            req.prefill_resume_split_index = batch.split_index
+            req.prefill_state = PrefillState.PREEMPTED
+        logger.info(
+            "FlowPrefill: preempted batch enqueued "
+            "(rids=%s, split_index=%d, preemptions=%s, queue_len=%d)",
+            [r.rid for r in batch.reqs],
+            batch.split_index,
+            [r.prefill_num_preemptions for r in batch.reqs],
+            len(self.preempted_prefill_queue) + len(batch.reqs),
+        )
+        self.preempted_prefill_queue.extend(batch.reqs)
+        self._record_flowprefill_preempted_batch(batch)
+
+    def _clear_flowprefill_batch_runtime_state(self, batch: ScheduleBatch) -> None:
+        batch.split_prefill_finished = False
+        batch.split_forward_count = self.server_args.flowprefill_split_layers
+
+    def _get_flowprefill_resume_batch_for_req(
+        self, req: Req
+    ) -> Optional[ScheduleBatch]:
+        """Resolve the resumed batch for a parked FlowPrefill request.
+
+        Current behavior is still an intermediate request-owned design:
+        the queue stores requests, but multi-request resumes fall back to the
+        parked batch snapshot referenced from each request's FlowPrefill ctx.
+        This helper isolates that compatibility layer so we can later replace it
+        with true request-level regrouping.
+        """
+
+        return req.flowprefill_ctx.resume_batch
+
+    def _get_flowprefill_single_req_resume_guard_failure(
+        self, req: Req
+    ) -> Optional[str]:
+        resume_batch = req.flowprefill_ctx.resume_batch
+        if req.flowprefill_ctx.split_forward_batch is None:
+            return "missing split_forward_batch"
+        if resume_batch is not None and len(resume_batch.reqs) != 1:
+            return "resume batch has multiple requests"
+        if req.grammar is not None:
+            return "grammar-constrained request"
+        if req.input_embeds is not None:
+            return "input_embeds request"
+        if req.multimodal_inputs is not None:
+            return "multimodal request"
+        if self.model_config.is_encoder_decoder:
+            return "encoder-decoder model"
+        return None
+
+    def _can_resume_flowprefill_req_as_single_batch(self, req: Req) -> bool:
+        return self._get_flowprefill_single_req_resume_guard_failure(req) is None
+
+    def _get_flowprefill_regroupable_reqs(self, seed_req: Req) -> List[Req]:
+        if not self._can_resume_flowprefill_req_as_single_batch(seed_req):
+            return [seed_req]
+
+        split_index = seed_req.flowprefill_ctx.split_index
+        regroupable = [
+            req
+            for req in self.preempted_prefill_queue
+            if req.flowprefill_ctx.split_index == split_index
+            and self._can_resume_flowprefill_req_as_single_batch(req)
+        ]
+        regroupable.sort(key=self._flowprefill_preempted_req_priority_key)
+        return regroupable
+
+    def _build_flowprefill_regrouped_batch(
+        self, reqs: List[Req]
+    ) -> Optional[ScheduleBatch]:
+        if not reqs:
+            return None
+        if len(reqs) == 1:
+            return ScheduleBatch.init_single_req_from_flowprefill_ctx(
+                reqs[0],
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator,
+                self.tree_cache,
+                self.model_config,
+                self.enable_overlap,
+                self.spec_algorithm,
+            )
+
+        resumed_batches = [
+            ScheduleBatch.init_single_req_from_flowprefill_ctx(
+                req,
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator,
+                self.tree_cache,
+                self.model_config,
+                self.enable_overlap,
+                self.spec_algorithm,
+            )
+            for req in reqs
+        ]
+        regrouped_batch = resumed_batches[0]
+        for resumed_batch in resumed_batches[1:]:
+            regrouped_batch.merge_batch(resumed_batch)
+        regrouped_batch.split_forward_batch = ForwardBatch.concat_for_flowprefill(
+            [batch.split_forward_batch for batch in resumed_batches]
+        )
+        regrouped_batch.seq_lens_cpu_cache = torch.cat(
+            [batch.seq_lens_cpu_cache for batch in resumed_batches]
+        )
+        regrouped_batch.split_attn_backend_needs_reinit = any(
+            batch.split_attn_backend_needs_reinit for batch in resumed_batches
+        )
+        regrouped_batch.split_index = reqs[0].flowprefill_ctx.split_index
+        regrouped_batch.split_forward_count = self.server_args.flowprefill_split_layers
+        regrouped_batch.prefill_stats = reqs[0].flowprefill_ctx.prefill_stats
+        regrouped_batch.prepare_for_split_prefill()
+        logger.info(
+            "FlowPrefill: regrouped parked requests into split-prefill batch "
+            "(rids=%s, split_index=%d, batch_size=%d)",
+            [req.rid for req in reqs],
+            regrouped_batch.split_index,
+            len(reqs),
+        )
+        return regrouped_batch
+
+    def _pop_next_flowprefill_batch(self) -> Optional[ScheduleBatch]:
+        if not self.preempted_prefill_queue:
+            return None
+
+        best_req = min(
+            self.preempted_prefill_queue,
+            key=self._flowprefill_preempted_req_priority_key,
+        )
+        if (
+            FLOWPREFILL_HEURISTIC_DEBUG
+            and self.server_args.flowprefill_priority_policy == "slack_edf"
+        ):
+            logger.info(
+                "FlowPrefill heuristic debug: "
+                "(context=preempted_queue_pick, picked_rid=%s, picked_key=%s, queue=%s)",
+                best_req.rid,
+                self._flowprefill_preempted_req_priority_key(best_req),
+                [
+                    (req.rid, self._flowprefill_preempted_req_priority_key(req))
+                    for req in self.preempted_prefill_queue
+                ],
+            )
+        single_req_resume_failure = (
+            self._get_flowprefill_single_req_resume_guard_failure(best_req)
+        )
+        if single_req_resume_failure is None:
+            regrouped_reqs = self._get_flowprefill_regroupable_reqs(best_req)
+            if (
+                FLOWPREFILL_HEURISTIC_DEBUG
+                and self.server_args.flowprefill_priority_policy == "slack_edf"
+            ):
+                logger.info(
+                    "FlowPrefill heuristic debug: "
+                    "(context=regroupable_reqs, seed_rid=%s, regrouped=%s)",
+                    best_req.rid,
+                    [
+                        (req.rid, self._flowprefill_preempted_req_priority_key(req))
+                        for req in regrouped_reqs
+                    ],
+                )
+            for req in regrouped_reqs:
+                self.preempted_prefill_queue.remove(req)
+                req.prefill_state = PrefillState.RUNNING
+                req.prefill_resume_split_index = req.flowprefill_ctx.split_index
+            best_batch = self._build_flowprefill_regrouped_batch(regrouped_reqs)
+            if best_batch is None:
+                return None
+            # Request-owned resume rebuilds ScheduleBatch from parked ForwardBatch
+            # snapshots. The attention backend keeps forward metadata outside the
+            # snapshot, so resumed batches must force a metadata rebuild.
+            best_batch.split_attn_backend_needs_reinit = True
+            resume_mode = (
+                "request_regroup" if len(regrouped_reqs) > 1 else "single_request"
+            )
+            parked_duration_seconds = self._record_flowprefill_resume(
+                regrouped_reqs,
+                resume_mode=resume_mode,
+                split_index=best_batch.split_index,
+            )
+            if len(regrouped_reqs) > 1:
+                logger.info(
+                    "FlowPrefill: resuming regrouped parked requests "
+                    "(rids=%s, split_index=%d, queue_remaining=%d, parked_ms=%s, resume_mode=request_regroup)",
+                    [req.rid for req in regrouped_reqs],
+                    best_batch.split_index,
+                    len(self.preempted_prefill_queue),
+                    (
+                        f"{parked_duration_seconds * 1000.0:.3f}"
+                        if parked_duration_seconds is not None
+                        else "unknown"
+                    ),
+                )
+            else:
+                logger.info(
+                    "FlowPrefill: resuming single parked request "
+                    "(rid=%s, split_index=%d, queue_remaining=%d, parked_ms=%s, resume_mode=single_request)",
+                    best_req.rid,
+                    best_batch.split_index,
+                    len(self.preempted_prefill_queue),
+                    (
+                        f"{parked_duration_seconds * 1000.0:.3f}"
+                        if parked_duration_seconds is not None
+                        else "unknown"
+                    ),
+                )
+            return best_batch
+        self._record_flowprefill_resume_fallback(single_req_resume_failure)
+        logger.debug(
+            "FlowPrefill: falling back to parked batch resume for req %s "
+            "(reason=%s, split_index=%d)",
+            best_req.rid,
+            single_req_resume_failure,
+            best_req.flowprefill_ctx.split_index,
+        )
+
+        best_batch = self._get_flowprefill_resume_batch_for_req(best_req)
+        if best_batch is None:
+            self.preempted_prefill_queue.remove(best_req)
+            logger.warning(
+                "FlowPrefill: dropping parked request without resumable state "
+                "(rid=%s, split_index=%d)",
+                best_req.rid,
+                best_req.flowprefill_ctx.split_index,
+            )
+            return None
+
+        sibling_reqs = [
+            req
+            for req in self.preempted_prefill_queue
+            if req.flowprefill_ctx.resume_batch is best_batch
+        ]
+        for req in sibling_reqs:
+            self.preempted_prefill_queue.remove(req)
+        if best_batch.reqs:
+            best_batch.reqs[0].apply_flowprefill_ctx_to_batch(best_batch)
+        self._clear_flowprefill_batch_runtime_state(best_batch)
+        best_batch.split_attn_backend_needs_reinit = True
+        for req in best_batch.reqs:
+            req.prefill_state = PrefillState.RUNNING
+            req.prefill_resume_split_index = best_batch.split_index
+            req.sync_flowprefill_ctx_from_batch(best_batch)
+        parked_duration_seconds = self._record_flowprefill_resume(
+            best_batch.reqs,
+            resume_mode="parked_batch_fallback",
+            split_index=best_batch.split_index,
+        )
+        logger.info(
+            "FlowPrefill: resuming preempted batch "
+            "(rids=%s, split_index=%d, queue_remaining=%d, parked_ms=%s, resume_mode=parked_batch_fallback, fallback_reason=%s)",
+            [r.rid for r in best_batch.reqs],
+            best_batch.split_index,
+            len(self.preempted_prefill_queue),
+            (
+                f"{parked_duration_seconds * 1000.0:.3f}"
+                if parked_duration_seconds is not None
+                else "unknown"
+            ),
+            single_req_resume_failure,
+        )
+        return best_batch
+
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if not self._set_or_validate_priority(req):
@@ -1844,8 +2876,12 @@ class Scheduler(
             if self._abort_on_queued_limit(req):
                 return
             self._prefetch_kvcache(req)
+            req.prefill_state = PrefillState.WAITING
+            req.prefill_preempt_pending = False
+            req.prefill_resume_split_index = 0
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
+            self._maybe_mark_flowprefill_preempt_pending(req)
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
@@ -1983,6 +3019,7 @@ class Scheduler(
             time_stats=recv_req.time_stats,
         )
         req.tokenizer = self.tokenizer
+        self._initialize_flowprefill_scheduling_fields(req, recv_req)
 
         # Handle multimodal inputs
         if recv_req.image_inputs is not None:
@@ -2101,6 +3138,29 @@ class Scheduler(
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
                 new_batch = self._build_hisparse_decode_batch(ready_reqs)
+        if self.last_batch and self.last_batch.forward_mode.is_split_prefill():
+            # FlowPrefill split-prefill batches keep their own lifecycle and should
+            # not be merged into the decode running batch.
+            pass
+        elif self.last_batch and self.last_batch.forward_mode.is_extend():
+            if self.last_batch.chunked_req is not None:
+                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
+                # We need to discard it.
+                chunked_req_to_exclude.add(self.last_batch.chunked_req)
+
+            if self.dllm_config is not None and self.last_batch.reqs:
+                chunked_req_to_exclude.update(self.last_batch.reqs)
+
+            # Filter batch
+            last_bs = self.last_batch.batch_size()
+            self.last_batch.filter_batch(
+                chunked_req_to_exclude=list(chunked_req_to_exclude)
+            )
+            if self.last_batch.batch_size() < last_bs:
+                self.running_batch.batch_is_full = False
+
+            # Merge the new batch into the running batch.
+            if not self.last_batch.is_empty():
                 if self.running_batch.is_empty():
                     self.running_batch = new_batch
                 else:
@@ -2139,6 +3199,9 @@ class Scheduler(
         # even when no new batches arrive (e.g. traffic stops).
         if self.running_batch.is_prefill_only:
             self.running_batch.filter_batch()
+
+        if self.running_split_prefill_batch is not None:
+            return self.running_split_prefill_batch
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
@@ -2219,6 +3282,61 @@ class Scheduler(
 
         return ret
 
+    def _get_next_flowprefill_candidate(self) -> Optional[ScheduleBatch]:
+        self._clear_flowprefill_waiting_candidate_selection()
+        self.policy.calc_priority(self.waiting_queue, self.running_batch)
+
+        waiting_candidate_reqs, waiting_candidate_key = (
+            self._get_flowprefill_waiting_candidate()
+        )
+        best_waiting_req = (
+            waiting_candidate_reqs[0] if waiting_candidate_reqs else None
+        )
+        best_preempted_req = (
+            min(
+                self.preempted_prefill_queue,
+                key=self._flowprefill_preempted_req_priority_key,
+            )
+            if self.preempted_prefill_queue
+            else None
+        )
+
+        if best_waiting_req is None:
+            return self._pop_next_flowprefill_batch()
+        if best_preempted_req is None:
+            if waiting_candidate_reqs is not None:
+                self._set_flowprefill_waiting_candidate_selection(waiting_candidate_reqs)
+            return None
+        preempted_candidate_reqs = self._get_flowprefill_preempted_candidate_reqs(
+            best_preempted_req
+        )
+        preempted_key = self._get_flowprefill_candidate_priority_key(
+            preempted_candidate_reqs
+        )
+        waiting_key = (
+            waiting_candidate_key
+            if waiting_candidate_key is not None
+            else (*self._flowprefill_priority_key(best_waiting_req), -1)
+        )
+        if (
+            FLOWPREFILL_HEURISTIC_DEBUG
+            and self.server_args.flowprefill_priority_policy == "slack_edf"
+        ):
+            logger.info(
+                "FlowPrefill heuristic debug: "
+                "(context=resume_candidate_selection, best_waiting_rid=%s, "
+                "best_waiting_key=%s, best_preempted_rid=%s, best_preempted_key=%s)",
+                best_waiting_req.rid,
+                waiting_key,
+                best_preempted_req.rid,
+                preempted_key,
+            )
+        if preempted_key < waiting_key:
+            return self._pop_next_flowprefill_batch()
+        if waiting_candidate_reqs is not None:
+            self._set_flowprefill_waiting_candidate_selection(waiting_candidate_reqs)
+        return None
+
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
@@ -2230,6 +3348,14 @@ class Scheduler(
 
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
+
+        if self.enable_flowprefill:
+            resumed_batch = self._get_next_flowprefill_candidate()
+            if resumed_batch is not None:
+                self._set_running_split_prefill_batch(
+                    resumed_batch, resume_mode="resumed"
+                )
+                return resumed_batch
 
         if self.enable_priority_preemption:
             # Reset batch_is_full to try preemption with a prefill adder.
@@ -2257,6 +3383,7 @@ class Scheduler(
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, self.running_batch)
+        self._reorder_flowprefill_waiting_queue_for_selected_candidate()
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -2273,6 +3400,18 @@ class Scheduler(
                 chunked_prefill_size = dynamic_size
 
         # Prefill policy
+        selected_waiting_candidate_size = getattr(
+            self, "_flowprefill_selected_waiting_candidate_size", None
+        )
+        prefill_max_requests = self.server_args.prefill_max_requests
+        if selected_waiting_candidate_size is not None:
+            if prefill_max_requests is None:
+                prefill_max_requests = selected_waiting_candidate_size
+            else:
+                prefill_max_requests = min(
+                    prefill_max_requests, selected_waiting_candidate_size
+                )
+
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
@@ -2285,7 +3424,7 @@ class Scheduler(
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=self.max_prefill_bs,
             max_running_requests=self.max_running_requests,
-            prefill_max_requests=self.server_args.prefill_max_requests,
+            prefill_max_requests=prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
         )
@@ -2365,6 +3504,7 @@ class Scheduler(
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            self._clear_flowprefill_waiting_candidate_selection()
             return None
 
         can_run_set = set(can_run_list)
@@ -2433,6 +3573,16 @@ class Scheduler(
         else:
             new_batch.decoding_reqs = None
 
+        if self.enable_flowprefill and new_batch is not None:
+            new_batch.prepare_for_split_prefill()
+            new_batch.split_forward_count = self.server_args.flowprefill_split_layers
+            for req in new_batch.reqs:
+                req.sync_flowprefill_ctx_from_batch(new_batch)
+            self._set_running_split_prefill_batch(
+                new_batch, resume_mode="new_request"
+            )
+
+        self._clear_flowprefill_waiting_candidate_selection()
         return new_batch
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
@@ -2538,8 +3688,9 @@ class Scheduler(
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
 
-        # Capture prefill start time for EXTEND mode
-        if batch.forward_mode == ForwardMode.EXTEND:
+        # Capture prefill start time for all prefill-style forwards, including
+        # FlowPrefill split-prefill steps.
+        if batch.forward_mode.is_prefill():
             set_time_batch(batch.reqs, "set_prefill_run_batch_start_time")
 
         # Place holder handling for pd-disagg decode event loop
@@ -2606,6 +3757,15 @@ class Scheduler(
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
+                # For split-prefill (FlowPrefill), preserve the forward batch state
+                # across multiple forward passes.
+                if batch.forward_mode.is_split_prefill():
+                    # Copy the saved forward batch state from ScheduleBatch to ModelWorkerBatch
+                    if batch.split_forward_batch is not None:
+                        worker_batch_or_batch.split_forward_batch = (
+                            batch.split_forward_batch
+                        )
+
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
                     if self.spec_algorithm.is_none()
@@ -2613,8 +3773,23 @@ class Scheduler(
                 )
                 with self.record_forward_metrics(batch):
                     batch_result = self.model_worker.forward_batch_generation(
-                        worker_batch_or_batch, **kwargs
+                        worker_batch_or_batch,
+                        reinit_attn_backend=(
+                            batch.split_attn_backend_needs_reinit
+                            if batch.forward_mode.is_split_prefill()
+                            else False
+                        ),
+                        **kwargs,
                     )
+
+                # Save the forward batch state back to ScheduleBatch for split-prefill
+                if batch.forward_mode.is_split_prefill():
+                    batch.split_attn_backend_needs_reinit = False
+                    if batch.split_forward_batch is None:
+                        batch.split_forward_batch = (
+                            worker_batch_or_batch.split_forward_batch
+                        )
+
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 
@@ -2655,8 +3830,9 @@ class Scheduler(
                 embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
                 ret = EmbeddingBatchResult(embeddings=embeddings)
 
-        # Capture prefill end time for EXTEND mode
-        if batch.forward_mode == ForwardMode.EXTEND:
+        # Capture prefill end time for all prefill-style forwards, including
+        # FlowPrefill split-prefill steps.
+        if batch.forward_mode.is_prefill():
             set_time_batch(batch.reqs, "set_prefill_run_batch_end_time")
 
         if (
@@ -2699,6 +3875,54 @@ class Scheduler(
         if batch_result.logits_output is not None:
             batch_result.logits_output.next_token_logits = None
 
+    def process_batch_result_split_prefill(
+        self,
+        batch: ScheduleBatch,
+        result: Union[GenerationBatchResult, EmbeddingBatchResult],
+    ) -> None:
+        previous_split_index = batch.split_index
+        if batch.split_forward_batch is not None:
+            batch.split_index = batch.split_forward_batch.split_index
+
+        self._observe_flowprefill_split_execution(batch, previous_split_index)
+
+        is_finished = batch.split_index >= self.model_config.num_hidden_layers
+        if is_finished:
+            self.running_split_prefill_batch = None
+            for req in batch.reqs:
+                req.prefill_preempt_pending = False
+                req.prefill_state = PrefillState.FINISHED
+                req.reset_flowprefill_ctx()
+            batch.split_forward_batch = None
+            batch.forward_mode = ForwardMode.EXTEND
+            self.process_batch_result_prefill(batch, result)
+            return
+
+        if any(req.to_finish for req in batch.reqs):
+            self.running_split_prefill_batch = None
+            batch.split_forward_batch = None
+            for req in batch.reqs:
+                req.prefill_state = PrefillState.ABORTED
+                req.reset_flowprefill_ctx()
+                if req.to_finish is not None:
+                    req.finished_reason = req.to_finish
+                    req.to_finish = None
+                release_kv_cache(req, self.tree_cache)
+            self.stream_output(batch.reqs, batch.return_logprob)
+            return
+
+        for req in batch.reqs:
+            req.prefill_resume_split_index = batch.split_index
+            self._refresh_flowprefill_predicted_remaining_time(
+                req, split_index=batch.split_index
+            )
+            self._refresh_flowprefill_slack(req)
+            req.sync_flowprefill_ctx_from_batch(batch)
+
+        if any(req.prefill_preempt_pending for req in batch.reqs):
+            self.running_split_prefill_batch = None
+            self._enqueue_preempted_flowprefill_batch(batch)
+
     def process_batch_result(
         self,
         batch: ScheduleBatch,
@@ -2706,6 +3930,8 @@ class Scheduler(
     ):
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
+        elif batch.forward_mode.is_split_prefill():
+            self.process_batch_result_split_prefill(batch, result)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
@@ -2756,6 +3982,7 @@ class Scheduler(
         # Batch running status
         idle = (
             self.running_batch.is_empty()
+            and self.running_split_prefill_batch is None
             and self.chunked_req is None
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
@@ -2766,6 +3993,7 @@ class Scheduler(
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
+        idle &= len(self.preempted_prefill_queue) == 0
 
         if not for_health_check:
             # Grammar queue and prefill inflight queue may not produce batch
@@ -3077,6 +4305,34 @@ class Scheduler(
         # In this case, we change the input_ids to be only one token to make this prefill cheap.
         self.grammar_manager.abort_requests(recv_req)
 
+        if self.enable_flowprefill and self.preempted_prefill_queue:
+            remaining_reqs = deque()
+            handled_batches = set()
+            for req in self.preempted_prefill_queue:
+                resume_batch = req.flowprefill_ctx.resume_batch
+                batch_id = id(resume_batch) if resume_batch is not None else None
+                if batch_id in handled_batches:
+                    continue
+
+                sibling_reqs = resume_batch.reqs if resume_batch is not None else [req]
+                should_abort = any(
+                    recv_req.abort_all or sibling_req.rid.startswith(recv_req.rid)
+                    for sibling_req in sibling_reqs
+                )
+                if should_abort:
+                    for sibling_req in sibling_reqs:
+                        sibling_req.reset_flowprefill_ctx()
+                        release_kv_cache(sibling_req, self.tree_cache, is_insert=False)
+                        self.send_to_tokenizer.send_output(
+                            AbortReq(rid=sibling_req.rid), sibling_req
+                        )
+                else:
+                    remaining_reqs.extend(sibling_reqs)
+
+                if batch_id is not None:
+                    handled_batches.add(batch_id)
+            self.preempted_prefill_queue = remaining_reqs
+
         # Delete requests not in the waiting queue when PD disaggregation is enabled
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # Abort requests that have not yet been bootstrapped
@@ -3135,6 +4391,12 @@ class Scheduler(
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_finish = FINISH_ABORT()
+
+        if self.running_split_prefill_batch is not None:
+            for req in self.running_split_prefill_batch.reqs:
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    logger.debug(f"Abort running split-prefill request. {req.rid=}")
+                    req.to_finish = FINISH_ABORT()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

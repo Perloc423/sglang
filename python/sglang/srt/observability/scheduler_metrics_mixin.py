@@ -309,6 +309,9 @@ class SchedulerMetricsMixin:
                 self.waiting_queue, priority_enabled
             )
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
+            self.stats.num_preempted_prefill_queue_reqs = len(
+                getattr(self, "preempted_prefill_queue", ())
+            )
             self.stats.cache_hit_rate = cache_hit_rate
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens
@@ -514,6 +517,9 @@ class SchedulerMetricsMixin:
                 self.waiting_queue, priority_enabled
             )
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
+            self.stats.num_preempted_prefill_queue_reqs = len(
+                getattr(self, "preempted_prefill_queue", ())
+            )
             self.stats.cache_hit_rate = cache_hit_rate
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens
