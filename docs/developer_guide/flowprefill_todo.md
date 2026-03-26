@@ -131,6 +131,14 @@ layer-level MVP 与论文
 - 当前 regroup 仍是最小版本：
   只对同 `split_index`、且满足 request-owned resume guard 的 parked req 生效，
   更复杂的 regroup / fallback 收缩仍待继续收口。
+- 当前 `slack_edf` 还包含两项面向非 short 请求的稳定化逻辑：
+  1. bounded long-request rescue
+  2. preemption budget + cooldown
+- 这两项改动已经在本地 replay 中验证确实进入关键路径，并且相较于更早的
+  激进 rescue 版本，已经明显减少“大 candidate 整批抢权”的情况。
+- 之后又尝试过一个 waiting-side medium/long batch-size cap
+  （medium `<= 2`、long `<= 1`），但 replay 结果更差，现已回退。
+  这个方向目前应视为已证伪，而不是待继续推进项。
 
 ## 下一步具体任务
 
@@ -249,6 +257,13 @@ layer-level MVP 与论文
   3. bounded rescue bonus
   4. class-aware minimum service guarantees
 
+补充说明：
+
+- 当前已经不是“完全没有 rescue”，而是“已有 non-short rescue，但缺少对
+  short tight-SLO 请求的 bounded rescue”。
+- 后续优化重点不应继续放在放大 long rescue 或强行压缩 waiting batch size，
+  而应转到 short-request rescue / anti-starvation。
+
 ### P8：把 decode-controlled replay 纳入 FlowPrefill benchmark 常规流程
 
 - 当前仓库已经有：
@@ -295,6 +310,17 @@ layer-level MVP 与论文
   2. batch-shape-aware predictor
   3. resumed-request-specific normalization
   4. predictor error versus class-level goodput
+
+### Done：replay harness 已基本收口为当前本地实验基线
+
+- `bench_flowprefill_trace_replay.py` 已修复 request-rate replay 的累计时间轴问题，
+  不再把相邻请求 delay 错当成绝对发送时间。
+- replay workload 加载已支持基于时间窗口和 `max_requests` 的流式提前退出，
+  便于在大 trace 上做小窗口实验。
+- `run_trace_replay.sh` 已提供统一输出命名和 `/flush_cache` 预处理。
+- `run_qwen3_30b_a3b_matrix.sh` 已提供当前单卡 `Qwen3-30B-A3B` 的 workload
+  与 replay 矩阵入口。
+- 后续如果 benchmark 口径再变化，应优先更新这些脚本，而不是继续手写临时命令。
 
 ### Future：兼容性扩展规划
 

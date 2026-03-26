@@ -18,6 +18,7 @@ def make_req(rid: str, priority: int, wait_time: float, split_index: int = 0):
         resume_batch=None,
         preempt_pending_since=None,
         preempted_at=None,
+        preemption_protected_until=None,
     )
     req = SimpleNamespace()
     req.rid = rid
@@ -92,6 +93,7 @@ def make_req(rid: str, priority: int, wait_time: float, split_index: int = 0):
         req.flowprefill_ctx.resume_batch = None
         req.flowprefill_ctx.preempt_pending_since = None
         req.flowprefill_ctx.preempted_at = None
+        req.flowprefill_ctx.preemption_protected_until = None
 
     def sync_flowprefill_ctx_from_multi_req_batch(batch, req_index):
         if getattr(batch, "split_forward_batch", None) is None:
@@ -680,6 +682,58 @@ class TestFlowPrefillScheduler(CustomTestCase):
             ["seed"],
         )
 
+    def test_slack_edf_long_rescue_does_not_beat_short_seed(self):
+        self.scheduler.server_args.flowprefill_priority_policy = "slack_edf"
+
+        short_req = make_req("short", priority=1, wait_time=99.10)
+        short_req.origin_input_ids = [1] * 120
+        short_req.origin_input_ids_unpadded = [1] * 120
+        short_req.prefill_deadline_ts = 100.0
+        short_req.prefill_predicted_remaining_time = 0.05
+
+        long_req = make_req("long", priority=1, wait_time=98.00)
+        long_req.origin_input_ids = [1] * 4000
+        long_req.origin_input_ids_unpadded = [1] * 4000
+        long_req.prefill_deadline_ts = 106.0
+        long_req.prefill_predicted_remaining_time = 0.10
+
+        self.scheduler.waiting_queue = [short_req, long_req]
+
+        with patch("sglang.srt.managers.scheduler.time.perf_counter", return_value=99.0):
+            selected = self.scheduler._get_next_flowprefill_candidate()
+
+        self.assertIsNone(selected)
+        self.assertEqual(
+            self.scheduler._flowprefill_selected_waiting_candidate_rids,
+            ["short"],
+        )
+
+    def test_slack_edf_long_rescue_can_beat_non_short_seed_after_bounded_wait(self):
+        self.scheduler.server_args.flowprefill_priority_policy = "slack_edf"
+
+        medium_req = make_req("medium", priority=1, wait_time=99.10)
+        medium_req.origin_input_ids = [1] * 1200
+        medium_req.origin_input_ids_unpadded = [1] * 1200
+        medium_req.prefill_deadline_ts = 103.0
+        medium_req.prefill_predicted_remaining_time = 0.06
+
+        long_req = make_req("long", priority=1, wait_time=96.00)
+        long_req.origin_input_ids = [1] * 4000
+        long_req.origin_input_ids_unpadded = [1] * 4000
+        long_req.prefill_deadline_ts = 106.0
+        long_req.prefill_predicted_remaining_time = 0.10
+
+        self.scheduler.waiting_queue = [medium_req, long_req]
+
+        with patch("sglang.srt.managers.scheduler.time.perf_counter", return_value=99.0):
+            selected = self.scheduler._get_next_flowprefill_candidate()
+
+        self.assertIsNone(selected)
+        self.assertEqual(
+            self.scheduler._flowprefill_selected_waiting_candidate_rids,
+            ["long"],
+        )
+
     def test_incoming_infeasible_request_does_not_preempt_feasible_running_batch(self):
         self.scheduler.server_args.flowprefill_priority_policy = "slack_edf"
         running_req = make_req("running", priority=1, wait_time=10.0)
@@ -698,6 +752,35 @@ class TestFlowPrefillScheduler(CustomTestCase):
 
         self.assertFalse(running_req.prefill_preempt_pending)
         self.assertEqual(running_req.prefill_state, PrefillState.WAITING)
+
+    def test_repeatedly_preempted_long_request_gets_preemption_cooldown_after_resume(self):
+        self.scheduler.server_args.flowprefill_priority_policy = "slack_edf"
+
+        running_req = make_req("running_long", priority=1, wait_time=10.0, split_index=1)
+        running_req.origin_input_ids = [1] * 4000
+        running_req.origin_input_ids_unpadded = [1] * 4000
+        running_req.prefill_deadline_ts = 200.0
+        running_req.prefill_predicted_remaining_time = 0.20
+        running_req.prefill_num_preemptions = 2
+        running_batch = make_batch([running_req], split_index=1)
+        self.scheduler.running_split_prefill_batch = running_batch
+
+        with patch("sglang.srt.managers.scheduler.time.perf_counter", return_value=100.0):
+            self.scheduler._record_flowprefill_resume(
+                [running_req], resume_mode="request_regroup", split_index=1
+            )
+
+        incoming_req = make_req("incoming_short", priority=1, wait_time=20.0)
+        incoming_req.origin_input_ids = [1] * 120
+        incoming_req.origin_input_ids_unpadded = [1] * 120
+        incoming_req.prefill_deadline_ts = 100.3
+        incoming_req.prefill_predicted_remaining_time = 0.05
+
+        with patch("sglang.srt.managers.scheduler.time.perf_counter", return_value=100.1):
+            self.scheduler._maybe_mark_flowprefill_preempt_pending(incoming_req)
+
+        self.assertFalse(running_req.prefill_preempt_pending)
+        self.assertGreater(running_req.flowprefill_ctx.preemption_protected_until, 100.1)
 
     def test_intermediate_split_prefill_is_enqueued_when_preempt_pending(self):
         req = make_req("r0", priority=5, wait_time=1.0, split_index=1)

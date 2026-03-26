@@ -242,6 +242,7 @@ class FlowPrefillExecCtx:
     resume_batch: Optional["ScheduleBatch"] = None
     preempt_pending_since: Optional[float] = None
     preempted_at: Optional[float] = None
+    preemption_protected_until: Optional[float] = None
 
 
 class MultimodalInputFormat(Enum):

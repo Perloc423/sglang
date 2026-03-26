@@ -172,11 +172,26 @@ def load_workload(
     override_max_new_tokens: Optional[int],
 ) -> List[ReplayRequest]:
     requests: List[ReplayRequest] = []
+    window_end_seconds = (
+        None
+        if time_window_seconds is None
+        else window_start_seconds + time_window_seconds
+    )
+
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             if not line.strip():
                 continue
             obj = json.loads(line)
+            timestamp_s = float(obj.get("timestamp_s", 0.0))
+
+            # Workloads produced by build_qwentrace_workload.py are timestamp-sorted,
+            # so we can stop reading once we pass the selected contiguous window.
+            if timestamp_s < window_start_seconds:
+                continue
+            if window_end_seconds is not None and timestamp_s >= window_end_seconds:
+                break
+
             prompt, real_len = build_prompt_for_request(
                 tokenizer=tokenizer,
                 request_id=int(obj["request_id"]),
@@ -195,7 +210,7 @@ def load_workload(
                     ),
                     priority=int(obj["priority"]),
                     arrival_delay_s=float(obj["arrival_delay_s"]),
-                    timestamp_s=float(obj.get("timestamp_s", 0.0)),
+                    timestamp_s=timestamp_s,
                     ttft_slo_ms=(
                         float(obj["ttft_slo_ms"])
                         if obj.get("ttft_slo_ms") is not None
@@ -204,23 +219,8 @@ def load_workload(
                     prompt=prompt,
                 )
             )
-
-    requests.sort(key=lambda req: req.timestamp_s)
-
-    window_end_seconds = (
-        None
-        if time_window_seconds is None
-        else window_start_seconds + time_window_seconds
-    )
-    requests = [
-        req
-        for req in requests
-        if req.timestamp_s >= window_start_seconds
-        and (window_end_seconds is None or req.timestamp_s < window_end_seconds)
-    ]
-
-    if max_requests is not None:
-        requests = requests[:max_requests]
+            if max_requests is not None and len(requests) >= max_requests:
+                break
 
     if requests:
         first_timestamp_s = requests[0].timestamp_s
@@ -342,7 +342,10 @@ async def replay_requests(
         start = time.perf_counter()
 
         async def launch(i: int, req: ReplayRequest) -> None:
-            target = req.arrival_delay_s / request_rate_scale
+            # request_rate_scale should scale the request's absolute position on the
+            # replay timeline, not only the local inter-arrival delta. Otherwise
+            # most requests collapse toward the start time and distort the load.
+            target = req.timestamp_s / request_rate_scale
             wait = max(0.0, start + target - time.perf_counter())
             if wait > 0:
                 await asyncio.sleep(wait)

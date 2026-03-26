@@ -30,8 +30,8 @@ The current implementation uses the same priority direction as priority scheduli
 - By default, larger integer values mean higher priority.
 - If `--schedule-low-priority-values-first` is enabled, smaller integer values mean higher priority.
 
-`priority_fcfs` is the current production policy. `deadline_fcfs` and `slack_edf`
-are experimental. `slack_edf` now uses a first-pass feasible-first S-EDF:
+`priority_fcfs` is the current safer baseline. `deadline_fcfs` and `slack_edf`
+are experimental. `slack_edf` now uses a feasible-first S-EDF:
 
 - compute `deadline = arrival_time + TTFT_SLO`
 - compute `slack = deadline - now - TTFT_hat`
@@ -41,9 +41,10 @@ are experimental. `slack_edf` now uses a first-pass feasible-first S-EDF:
 
 `TTFT_SLO` can come from per-request metadata or the server-wide
 `--flowprefill-default-ttft-slo-ms`. `TTFT_hat` is still a lightweight heuristic
-predictor based on observed split-prefill runtime per layer, so this policy is
-not benchmark-calibrated yet. Among requests with the same effective priority,
-older requests still win.
+predictor based on observed split-prefill runtime per layer and prompt-length
+bucket statistics, so this policy is still benchmark-driven rather than fully
+calibrated. Among requests with the same effective priority, older requests
+still win.
 
 ## When to use it
 
@@ -57,7 +58,8 @@ It is generally **not** the first feature to enable if your main bottleneck is r
 
 ## Requirements and compatibility
 
-FlowPrefill is intentionally narrow in scope right now. It is enabled only when all of the following are true:
+FlowPrefill is intentionally narrow in scope right now. It is enabled only when
+all of the following are true:
 
 - `--enable-flowprefill` is set.
 - The model implements `forward_split_prefill`.
@@ -81,7 +83,7 @@ If any of these constraints are violated, SGLang will keep serving normally and 
 | `--flowprefill-granularity` | Checkpoint granularity. Only `layer` is supported today. | `layer` |
 | `--flowprefill-split-layers` | Number of transformer layers executed per split-prefill step. Smaller values create more preemption points but add more scheduler handoffs. | `1` |
 | `--flowprefill-max-preemptions` | Maximum cooperative preemptions allowed per request. `0` means unlimited. | `0` |
-| `--flowprefill-priority-policy` | Ordering policy for FlowPrefill. `priority_fcfs` is the current production policy. `deadline_fcfs` and `slack_edf` are experimental; `slack_edf` uses a feasible-first S-EDF with a lightweight heuristic TTFT predictor. | `priority_fcfs` |
+| `--flowprefill-priority-policy` | Ordering policy for FlowPrefill. `priority_fcfs` is the current safer baseline. `deadline_fcfs` and `slack_edf` are experimental; `slack_edf` uses a feasible-first S-EDF with a lightweight heuristic TTFT predictor. | `priority_fcfs` |
 | `--flowprefill-default-ttft-slo-ms` | Default TTFT SLO in milliseconds used to derive FlowPrefill deadlines when requests do not explicitly provide `prefill_ttft_slo_ms` or `prefill_deadline_ts`. | `None` |
 
 ## Usage
@@ -128,6 +130,13 @@ With `--schedule-low-priority-values-first`, smaller priority integers are consi
   for both long background requests and short urgent requests can make
   `slack_edf` perform worse than `priority_fcfs`. Prefer explicit request
   deadlines or at least different deadline classes for different workloads.
+- For the current `slack_edf`, start from per-request TTFT metadata rather than
+  one global default SLO. Mixed `text` / `search` / `file` workloads are
+  especially sensitive to this.
+- The current `slack_edf` keeps a bounded long-request rescue path and a small
+  preemption cooldown for repeatedly preempted non-short requests. These help
+  avoid pathological starvation, but they do not make `slack_edf` a universally
+  better policy than `priority_fcfs`.
 
 ## Benchmarking and debugging
 
@@ -141,6 +150,12 @@ The repository contains two useful local benchmark helpers under
 - [`bench_flowprefill_trace_replay.py`](/share/wwmq/mywork/sglang/benchmark/flowprefill/bench_flowprefill_trace_replay.py)
   replays that workload against the native `/generate` API and can attach
   `priority` and `prefill_ttft_slo_ms` per request.
+- [`run_trace_replay.sh`](/share/wwmq/mywork/sglang/benchmark/flowprefill/run_trace_replay.sh)
+  is a thin wrapper around the replay client that standardizes output naming
+  and flushes `/flush_cache` before each run.
+- [`run_qwen3_30b_a3b_matrix.sh`](/share/wwmq/mywork/sglang/benchmark/flowprefill/run_qwen3_30b_a3b_matrix.sh)
+  wraps the local single-GPU `Qwen3-30B-A3B` experiment matrix used in current
+  replay-based evaluation.
 
 For TTFT-focused experiments, use:
 
@@ -164,6 +179,17 @@ Prefer selecting a **contiguous time window** from the trace instead of random
 request shuffling. This preserves a more realistic request-rate pattern and
 keeps the replay closer to the original production trace.
 
+In the current local workflow, the most useful replay knobs are:
+
+- `--window-start-seconds`
+- `--time-window-seconds`
+- `--max-requests`
+- `--request-rate-scale`
+- `--override-max-new-tokens 1`
+
+The replay client now supports streaming window selection, so a short replay
+window does not require scanning the entire workload file first.
+
 For `slack_edf`, also enable scheduler timeline logging and inspect:
 
 - per-request `deadline_ms`
@@ -177,6 +203,35 @@ This is often the fastest way to distinguish:
 - predictor error
 - decode-bound overload
 - and actual prefill head-of-line blocking
+
+Two debug environment variables are especially useful when validating
+`slack_edf` behavior:
+
+```bash
+SGLANG_FLOWPREFILL_HEURISTIC_DEBUG=1
+SGLANG_SCHEDULER_TIMELINE_DEBUG=1
+```
+
+The first emits rescue / candidate / preempt-related heuristic logs. The second
+emits scheduler timeline events for waiting selection, preemption, parked
+resume, and completion.
+
+## Current observations
+
+The current single-GPU `QwenTrace` replay results support the following
+practical guidance:
+
+- `priority_fcfs` remains the safer baseline.
+- `slack_edf` can materially improve TTFT SLO attainment for tight-SLO `text`
+  requests in high-load, decode-controlled replay.
+- The same policy can still produce very large `search` / `file` tail latency
+  under sustained overload.
+- Recent work added a bounded long-request rescue path and a preemption
+  cooldown for repeatedly preempted non-short requests. This reduced the most
+  pathological large-batch rescue behavior, but did not eliminate long-request
+  tail inflation.
+- A later attempt to cap waiting-side medium/long batch size made results
+  worse and has already been reverted. That is not part of the current design.
 
 ## Limitations
 
@@ -192,6 +247,9 @@ This is often the fastest way to distinguish:
   estimator, not yet a benchmarked or calibrated production policy. In
   particular, a uniform server-level default SLO can still interact badly with
   mixed long/short workloads.
+- The current `slack_edf` includes bounded rescue / cooldown logic for non-short
+  requests, but these are still heuristic safeguards rather than a final policy
+  design. They help limit starvation, not guarantee low tail latency.
 - It depends on model support for `forward_split_prefill`, so availability varies by model implementation.
 - The current resume path is still transitional:
   single-request parked prefills resume from request-owned state, and

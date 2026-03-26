@@ -240,6 +240,11 @@ SCHEDULER_TIMELINE_DEBUG = get_bool_env_var("SGLANG_SCHEDULER_TIMELINE_DEBUG")
 FLOWPREFILL_PROMPT_LEN_BUCKET_UPPER_BOUNDS = (512, 2048)
 FLOWPREFILL_REQUEST_LOCAL_PREDICTOR_MIN_LAYERS = 8
 FLOWPREFILL_MIXED_CANDIDATE_MAX_INFLATION = 1.05
+FLOWPREFILL_LONG_RESCUE_WAIT_SECONDS = 2.0
+FLOWPREFILL_LONG_RESCUE_PREEMPTION_THRESHOLD = 2
+FLOWPREFILL_LONG_PREEMPTION_COOLDOWN_SECONDS = 0.25
+FLOWPREFILL_LONG_RESCUE_MAX_CANDIDATE_SIZE = 2
+FLOWPREFILL_LONG_RESCUE_SERVICE_TIME_SAFETY_FACTOR = 2.0
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
@@ -1919,6 +1924,162 @@ class Scheduler(
             return "medium"
         return "long"
 
+    def _get_flowprefill_wait_seconds(
+        self, req: Req, *, now: Optional[float] = None
+    ) -> float:
+        if now is None:
+            now = time.perf_counter()
+        wait_queue_entry_ts = getattr(req.time_stats, "wait_queue_entry_time", 0.0)
+        if wait_queue_entry_ts <= 0.0:
+            return 0.0
+        return max(0.0, now - wait_queue_entry_ts)
+
+    def _is_flowprefill_non_short_request(self, req: Req) -> bool:
+        return self._get_flowprefill_prompt_len_bucket(req) > 0
+
+    def _is_flowprefill_long_bucket_request(self, req: Req) -> bool:
+        return self._get_flowprefill_prompt_len_bucket(req) == 2
+
+    def _get_flowprefill_conservative_rescue_service_time(
+        self, candidate_service_time: Optional[float]
+    ) -> Optional[float]:
+        if candidate_service_time is None or candidate_service_time <= 0.0:
+            return candidate_service_time
+        return (
+            candidate_service_time * FLOWPREFILL_LONG_RESCUE_SERVICE_TIME_SAFETY_FACTOR
+        )
+
+    def _is_flowprefill_long_rescue_candidate(
+        self,
+        req: Req,
+        *,
+        candidate_service_time: Optional[float],
+        now: Optional[float] = None,
+    ) -> bool:
+        if self.server_args.flowprefill_priority_policy != "slack_edf":
+            return False
+        if not self._is_flowprefill_long_bucket_request(req):
+            return False
+        if candidate_service_time is None or candidate_service_time <= 0.0:
+            return False
+        if now is None:
+            now = time.perf_counter()
+        wait_seconds = self._get_flowprefill_wait_seconds(req, now=now)
+        if wait_seconds < FLOWPREFILL_LONG_RESCUE_WAIT_SECONDS:
+            return False
+        conservative_service_time = (
+            self._get_flowprefill_conservative_rescue_service_time(
+                candidate_service_time
+            )
+        )
+        protected_harm = self._get_flowprefill_protected_candidate_harm(
+            [req], conservative_service_time
+        )
+        if protected_harm > 0:
+            if (
+                FLOWPREFILL_HEURISTIC_DEBUG
+                and self.server_args.flowprefill_priority_policy == "slack_edf"
+            ):
+                logger.info(
+                    "FlowPrefill heuristic debug: "
+                    "(context=long_rescue_rejected, rid=%s, bucket=%d, wait_seconds=%.6f, "
+                    "candidate_service_time=%.6f, conservative_service_time=%.6f, protected_harm=%d)",
+                    req.rid,
+                    self._get_flowprefill_prompt_len_bucket(req),
+                    wait_seconds,
+                    candidate_service_time,
+                    conservative_service_time,
+                    protected_harm,
+                )
+            return False
+        if (
+            FLOWPREFILL_HEURISTIC_DEBUG
+            and self.server_args.flowprefill_priority_policy == "slack_edf"
+        ):
+            logger.info(
+                "FlowPrefill heuristic debug: "
+                "(context=long_rescue_candidate, rid=%s, bucket=%d, wait_seconds=%.6f, "
+                "candidate_service_time=%.6f, conservative_service_time=%.6f, preemptions=%d)",
+                req.rid,
+                self._get_flowprefill_prompt_len_bucket(req),
+                wait_seconds,
+                candidate_service_time,
+                conservative_service_time,
+                req.prefill_num_preemptions,
+            )
+        return True
+
+    def _get_flowprefill_candidate_rescue_tier(
+        self,
+        candidate_reqs: List[Req],
+        *,
+        candidate_service_time: Optional[float],
+        now: Optional[float] = None,
+    ) -> int:
+        if not candidate_reqs:
+            return 1
+        if now is None:
+            now = time.perf_counter()
+        candidate_size = len(candidate_reqs)
+        if candidate_size > FLOWPREFILL_LONG_RESCUE_MAX_CANDIDATE_SIZE:
+            if (
+                FLOWPREFILL_HEURISTIC_DEBUG
+                and self.server_args.flowprefill_priority_policy == "slack_edf"
+            ):
+                logger.info(
+                    "FlowPrefill heuristic debug: "
+                    "(context=long_rescue_rejected, candidate_rids=%s, candidate_size=%d, "
+                    "candidate_service_time=%s, reason=max_candidate_size)",
+                    [req.rid for req in candidate_reqs],
+                    candidate_size,
+                    (
+                        f"{candidate_service_time:.6f}"
+                        if candidate_service_time is not None
+                        else "None"
+                    ),
+                )
+            return 1
+        if any(
+            not self._is_flowprefill_long_bucket_request(req) for req in candidate_reqs
+        ):
+            return 1
+        rescued_rids = [
+            req.rid
+            for req in candidate_reqs
+            if self._is_flowprefill_long_rescue_candidate(
+                req, candidate_service_time=candidate_service_time, now=now
+            )
+        ]
+        if rescued_rids:
+            if (
+                FLOWPREFILL_HEURISTIC_DEBUG
+                and self.server_args.flowprefill_priority_policy == "slack_edf"
+            ):
+                logger.info(
+                    "FlowPrefill heuristic debug: "
+                    "(context=candidate_rescue_tier, candidate_rids=%s, rescued_rids=%s, "
+                    "candidate_size=%d, candidate_service_time=%s, rescue_tier=%d)",
+                    [req.rid for req in candidate_reqs],
+                    rescued_rids,
+                    candidate_size,
+                    (
+                        f"{candidate_service_time:.6f}"
+                        if candidate_service_time is not None
+                        else "None"
+                    ),
+                    0,
+                )
+            return 0
+        return 1
+
+    def _get_flowprefill_candidate_class_rank(self, candidate_reqs: List[Req]) -> int:
+        if not candidate_reqs:
+            return 1
+        min_bucket = min(
+            self._get_flowprefill_prompt_len_bucket(req) for req in candidate_reqs
+        )
+        return 0 if min_bucket == 0 else 1
+
     def _log_flowprefill_timeline_event(
         self,
         req: Req,
@@ -2550,7 +2711,22 @@ class Scheduler(
             candidate_reqs,
             candidate_service_time=candidate_remaining,
         )
-        return candidate_reqs, (seed_key[0], waiting_harm, *seed_key[1:], -len(candidate_reqs))
+        rescue_tier = self._get_flowprefill_candidate_rescue_tier(
+            candidate_reqs,
+            candidate_service_time=candidate_remaining,
+            now=now,
+        )
+        candidate_class_rank = self._get_flowprefill_candidate_class_rank(
+            candidate_reqs
+        )
+        return candidate_reqs, (
+            seed_key[0],
+            candidate_class_rank,
+            rescue_tier,
+            waiting_harm,
+            *seed_key[1:],
+            -len(candidate_reqs),
+        )
 
     def _get_flowprefill_preempted_candidate_size(self, req: Req) -> int:
         resume_batch = self._get_flowprefill_resume_batch_for_req(req)
@@ -2707,7 +2883,22 @@ class Scheduler(
         candidate_harm = self._get_flowprefill_candidate_harm(
             candidate_reqs, candidate_service_time
         )
-        return (seed_key[0], candidate_harm, *seed_key[1:], -len(candidate_reqs))
+        rescue_tier = self._get_flowprefill_candidate_rescue_tier(
+            candidate_reqs,
+            candidate_service_time=candidate_service_time,
+            now=now,
+        )
+        candidate_class_rank = self._get_flowprefill_candidate_class_rank(
+            candidate_reqs
+        )
+        return (
+            seed_key[0],
+            candidate_class_rank,
+            rescue_tier,
+            candidate_harm,
+            *seed_key[1:],
+            -len(candidate_reqs),
+        )
 
     def _clear_flowprefill_waiting_candidate_selection(self) -> None:
         self._flowprefill_selected_waiting_candidate_rids = None
@@ -2759,12 +2950,37 @@ class Scheduler(
         if req.finished():
             return False
         batch = self.running_split_prefill_batch
+        now = time.perf_counter()
         if any(r.prefill_preempt_pending for r in batch.reqs):
             return False
         if self.server_args.flowprefill_max_preemptions > 0 and any(
             r.prefill_num_preemptions >= self.server_args.flowprefill_max_preemptions
             for r in batch.reqs
         ):
+            return False
+        protected_running_reqs = [
+            r
+            for r in batch.reqs
+            if self._is_flowprefill_non_short_request(r)
+            and r.prefill_num_preemptions >= FLOWPREFILL_LONG_RESCUE_PREEMPTION_THRESHOLD
+            and getattr(r.flowprefill_ctx, "preemption_protected_until", None) is not None
+            and r.flowprefill_ctx.preemption_protected_until > now
+        ]
+        if protected_running_reqs:
+            if (
+                FLOWPREFILL_HEURISTIC_DEBUG
+                and self.server_args.flowprefill_priority_policy == "slack_edf"
+            ):
+                logger.info(
+                    "FlowPrefill heuristic debug: "
+                    "(context=preempt_cooldown_block, incoming_rid=%s, protected_running_rids=%s, protected_until=%s)",
+                    req.rid,
+                    [r.rid for r in protected_running_reqs],
+                    [
+                        f"{r.flowprefill_ctx.preemption_protected_until:.6f}"
+                        for r in protected_running_reqs
+                    ],
+                )
             return False
         incoming_key = self._flowprefill_priority_key(req)
         running_key = self._flowprefill_batch_request_priority_key(batch)
@@ -2820,6 +3036,28 @@ class Scheduler(
                 parked_latencies.append(max(0.0, now - parked_at))
             req.flowprefill_ctx.preempted_at = None
             req.flowprefill_ctx.preempt_pending_since = None
+            if (
+                self._is_flowprefill_non_short_request(req)
+                and req.prefill_num_preemptions >= FLOWPREFILL_LONG_RESCUE_PREEMPTION_THRESHOLD
+            ):
+                req.flowprefill_ctx.preemption_protected_until = (
+                    now + FLOWPREFILL_LONG_PREEMPTION_COOLDOWN_SECONDS
+                )
+                if (
+                    FLOWPREFILL_HEURISTIC_DEBUG
+                    and self.server_args.flowprefill_priority_policy == "slack_edf"
+                ):
+                    logger.info(
+                        "FlowPrefill heuristic debug: "
+                        "(context=preempt_cooldown_set, rid=%s, preemptions=%d, "
+                        "protected_until=%.6f, cooldown_seconds=%.6f)",
+                        req.rid,
+                        req.prefill_num_preemptions,
+                        req.flowprefill_ctx.preemption_protected_until,
+                        FLOWPREFILL_LONG_PREEMPTION_COOLDOWN_SECONDS,
+                    )
+            else:
+                req.flowprefill_ctx.preemption_protected_until = None
 
         parked_duration_seconds = max(parked_latencies) if parked_latencies else None
         self._update_flowprefill_queue_stats()
